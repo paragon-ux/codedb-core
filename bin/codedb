@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { codedbBinaryPath } from "../dist/index.js";
+
+const bin = codedbBinaryPath();
+if (!bin) {
+  process.stderr.write(
+    "codedb-core: no prebuilt binary for this platform (" +
+      `${process.platform}-${process.arch}).\n`,
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+if (result.error) {
+  process.stderr.write(`codedb-core: failed to launch binary: ${result.error.message}\n`);
+  process.exit(1);
+}
+process.exit(result.status ?? 1);

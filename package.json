@@ -1,0 +1,54 @@
+{
+  "name": "@paragon-ux/codedb-core",
+  "version": "1.0.0",
+  "description": "Deterministic structural code intelligence — lexical-only fork of codedb: outline, symbol, call graph, and trigram search. No embeddings, no telemetry, no cloud, no daemon.",
+  "license": "BSD-3-Clause",
+  "author": "paragon-ux (fork of justrach/codedb)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paragon-ux/codedb-core.git"
+  },
+  "homepage": "https://github.com/paragon-ux/codedb-core#readme",
+  "bugs": {
+    "url": "https://github.com/paragon-ux/codedb-core/issues"
+  },
+  "keywords": [
+    "code-intelligence",
+    "call-graph",
+    "symbol-index",
+    "code-search",
+    "deterministic",
+    "cli",
+    "zig"
+  ],
+  "type": "module",
+  "files": [
+    "bin",
+    "dist",
+    "src",
+    "README.md",
+    "INSTALL.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "codedb": "bin/codedb"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "node scripts/build-all.mjs",
+    "build:all": "node scripts/build-all.mjs",
+    "changeset": "changeset",
+    "prepack": "node scripts/build-all.mjs",
+    "test": "zig build test"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.5.2",
+    "@changesets/cli": "^2.31.0"
+  }
+}

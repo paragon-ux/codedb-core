@@ -1658,16 +1658,134 @@ pub const Explorer = struct {
         }
     }
 
+    fn skipJsString(content: []const u8, start: usize) usize {
+        const quote = content[start];
+        var i = start + 1;
+        while (i < content.len) : (i += 1) {
+            if (content[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (content[i] == quote) return i + 1;
+        }
+        return content.len;
+    }
+
+    /// Skip a JS/TS regex literal. Returns the index just past the closing `/`
+    /// (handling `[...]` character classes and `\` escapes), or `start` when no
+    /// closing slash appears before a newline (i.e. it was division, not regex).
+    fn skipJsRegex(content: []const u8, start: usize) usize {
+        var i = start + 1;
+        var in_class = false;
+        while (i < content.len) : (i += 1) {
+            const c = content[i];
+            if (c == '\\') {
+                i += 1;
+                continue;
+            }
+            if (c == '\n') return start;
+            if (c == '[') {
+                in_class = true;
+                continue;
+            }
+            if (c == ']') {
+                in_class = false;
+                continue;
+            }
+            if (c == '/' and !in_class) return i + 1;
+        }
+        return content.len;
+    }
+
+    /// True when `/` begins a regex literal given the previous significant char.
+    /// A `/` after a value (identifier, digit, `)`, `]`, quote, backtick) is
+    /// division; otherwise it is the start of a regex.
+    fn isRegexStart(prev: u8) bool {
+        return switch (prev) {
+            0, '(', '=', ',', ':', '!', '&', '|', '?', ';', '{', '}', '>', '<', '~', '%', '*', '+', '-', '^', '[', '#' => true,
+            else => false,
+        };
+    }
+
+    /// Skip a JS/TS template literal, balancing `${}` interpolation (which may
+    /// contain nested strings, template literals, comments, and object braces).
+    /// `start` points at the opening backtick; returns the index just past the
+    /// closing backtick (or content.len when unterminated).
+    fn skipJsTemplateLiteral(content: []const u8, start: usize) usize {
+        var i = start + 1;
+        while (i < content.len) {
+            const c = content[i];
+            if (c == '\\') {
+                i += 2;
+                continue;
+            }
+            if (c == '`') return i + 1;
+            if (c == '$' and i + 1 < content.len and content[i + 1] == '{') {
+                i += 2;
+                var brace_depth: usize = 1;
+                while (i < content.len and brace_depth > 0) {
+                    const d = content[i];
+                    if (d == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (d == '`') {
+                        i = skipJsTemplateLiteral(content, i);
+                        continue;
+                    }
+                    if (d == '"' or d == '\'') {
+                        i = skipJsString(content, i);
+                        continue;
+                    }
+                    if (d == '/' and i + 1 < content.len and content[i + 1] != '/' and content[i + 1] != '*') {
+                        const after = skipJsRegex(content, i);
+                        if (after > i) {
+                            i = after;
+                            continue;
+                        }
+                    }
+                    if (d == '/' and i + 1 < content.len and content[i + 1] == '/') {
+                        i += 2;
+                        while (i < content.len and content[i] != '\n') i += 1;
+                        continue;
+                    }
+                    if (d == '/' and i + 1 < content.len and content[i + 1] == '*') {
+                        i += 2;
+                        while (i + 1 < content.len and !(content[i] == '*' and content[i + 1] == '/')) i += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if (d == '{') {
+                        brace_depth += 1;
+                    } else if (d == '}') {
+                        brace_depth -= 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        return content.len;
+    }
+
     fn findBraceEnd(content: []const u8, line_offsets: []const usize, line_start: u32, total_lines: u32, language: Language) u32 {
         const start_idx = line_offsets[line_start - 1];
+        const is_js_ts = language == .javascript or language == .typescript;
+        const is_ts = language == .typescript;
         var depth: i32 = 0;
         var found_open = false;
         var in_string: u8 = 0; // 0=none, '"', '\''
         var in_triple_quote: u8 = 0; // 0=none, '"', '\''
         var interp_depth: i32 = 0;
-        var paren_depth: i32 = 0; // params/types before the body brace
+        var paren_depth: i32 = 0; // params before the body brace
+        var in_return_type = false; // TS: after the return-type ':'
+        var return_type_started = false; // TS: first non-ws char seen after ':'
+        var type_angle_depth: i32 = 0; // TS: generics in the return type
+        var type_brace_depth: i32 = 0; // TS: object-literal types in the return type
         var in_line_comment = false;
         var in_block_comment = false;
+        var prev_sig: u8 = 0; // last significant char (for regex-vs-division)
         var i = start_idx;
         var current_line = line_start;
 
@@ -1677,7 +1795,7 @@ pub const Explorer = struct {
             if (c == '\n') {
                 current_line += 1;
                 in_line_comment = false;
-                // Bail out if no opening brace found within 10 lines
+                // Bail out if no opening brace found within a bounded window.
                 if (!found_open and current_line > line_start + 24) return line_start;
                 continue;
             }
@@ -1721,6 +1839,13 @@ pub const Explorer = struct {
                 continue;
             }
 
+            // JS/TS template literals: skip the whole literal (balanced `${}`).
+            if (is_js_ts and c == '`') {
+                const after = skipJsTemplateLiteral(content, i);
+                i = if (after > i) after - 1 else i;
+                continue;
+            }
+
             // Check for comments
             if (c == '/' and i + 1 < content.len) {
                 if (content[i + 1] == '/') {
@@ -1729,6 +1854,16 @@ pub const Explorer = struct {
                 } else if (content[i + 1] == '*') {
                     in_block_comment = true;
                     i += 1;
+                    continue;
+                }
+            }
+
+            // JS/TS regex literal (division-vs-regex heuristic).
+            if (is_js_ts and c == '/' and isRegexStart(prev_sig)) {
+                const after = skipJsRegex(content, i);
+                if (after > i) {
+                    i = after - 1;
+                    prev_sig = ')'; // a regex is a value; following '/' is division
                     continue;
                 }
             }
@@ -1752,11 +1887,39 @@ pub const Explorer = struct {
                 if (!found_open) paren_depth += 1;
             } else if (c == ')') {
                 if (!found_open and paren_depth > 0) paren_depth -= 1;
+            } else if (is_ts and !found_open and !in_return_type and paren_depth == 0 and c == ':') {
+                in_return_type = true;
+                return_type_started = false;
+            } else if (is_ts and !found_open and in_return_type and c == ' ' or is_ts and !found_open and in_return_type and c == '\t') {
+                // whitespace within the return type does not start it
+            } else if (is_ts and !found_open and in_return_type) {
+                if (c == '<') {
+                    type_angle_depth += 1;
+                    return_type_started = true;
+                } else if (c == '>') {
+                    if (type_angle_depth > 0) type_angle_depth -= 1;
+                } else if (c == '{') {
+                    if (!return_type_started) {
+                        // Object-literal type begins immediately after ':'.
+                        return_type_started = true;
+                        type_brace_depth = 1;
+                    } else if (type_angle_depth > 0 or type_brace_depth > 0) {
+                        type_brace_depth += 1;
+                    } else {
+                        // Return type ended; this is the body brace.
+                        depth += 1;
+                        found_open = true;
+                        in_return_type = false;
+                    }
+                } else if (c == '}') {
+                    if (type_brace_depth > 0) type_brace_depth -= 1;
+                } else if (c != ' ' and c != '\t') {
+                    return_type_started = true;
+                }
             } else if (c == '{') {
                 // Before the body opens, only a brace at paren-depth 0 is the
                 // body brace; braces inside the parameter list (inline object
-                // types, default values) must be ignored, or a multi-line
-                // signature gets a wrongly-short line_end. Once found_open, count
+                // types, default values) must be ignored. Once found_open, count
                 // every brace so the body balances correctly.
                 if (found_open or paren_depth == 0) {
                     depth += 1;
@@ -1768,6 +1931,8 @@ pub const Explorer = struct {
                     if (depth == 0) return @min(current_line, total_lines);
                 }
             }
+
+            if (c != ' ' and c != '\t') prev_sig = c;
         }
 
         return if (found_open) total_lines else line_start;
@@ -3291,6 +3456,16 @@ pub const Explorer = struct {
             std.mem.indexOf(u8, path, "/fixtures/") != null;
     }
 
+    /// True when two languages are the same lexical family (JS/TS are one family).
+    /// Prevents a callee name extracted from one language from resolving to a
+    /// same-named definition in an unrelated language.
+    fn sameLangFamily(a: Language, b: Language) bool {
+        if (a == b) return true;
+        const js_a = a == .javascript or a == .typescript;
+        const js_b = b == .javascript or b == .typescript;
+        return js_a and js_b;
+    }
+
     /// Names so commonly used as stdlib/container/builtin methods across
     /// languages that a `name(` call site almost never refers to a user-defined
     /// free function of that name. Used to suppress false callee edges from
@@ -4777,7 +4952,56 @@ pub const Explorer = struct {
         var n2i = name_to_ids.iterator();
         while (n2i.next()) |e| resolve.put(e.key_ptr.*, e.value_ptr.items) catch return;
 
-        var edges_tmp = codegraph.buildEdges(a, funcs.items, &resolve, false) catch return;
+        // Resolved, fail-closed edges. Resolution priority mirrors HEAD's
+        // buildEdgesScoped (minus the Zig-only imported-module tier):
+        //   1. same-file helper — a bare callee resolves to the one non-test
+        //      definition in the caller's own file, even when the name is
+        //      ambiguous across the whole repo;
+        //   2. globally-unique name.
+        // Every tier keeps the fail-closed rule: ambiguity emits no edge, so
+        // `adj`/`radj` never fan out a bare-name collision to unrelated code.
+        var edges_tmp: std.ArrayList(codegraph.Edge) = .empty;
+        for (funcs.items) |f| {
+            const caller_path = node_path.items[f.id];
+            const caller_lang = detectLanguage(caller_path);
+            const callees = codegraph.extractCallees(a, f.body) catch continue;
+            for (callees) |name| {
+                if (isUbiquitousName(name)) continue;
+                const cands = resolve.get(name) orelse continue;
+
+                // Tier 1: same-file helper.
+                var same_file: ?codegraph.NodeId = null;
+                var same_count: usize = 0;
+                for (cands) |to| {
+                    if (to == f.id) continue;
+                    if (isLikelyTestPath(node_path.items[to])) continue;
+                    if (!sameLangFamily(caller_lang, detectLanguage(node_path.items[to]))) continue;
+                    if (!std.mem.eql(u8, node_path.items[to], caller_path)) continue;
+                    same_count += 1;
+                    if (same_count > 1) break;
+                    same_file = to;
+                }
+                if (same_count == 1) {
+                    edges_tmp.append(a, .{ .from = f.id, .to = same_file.?, .weight = 1.0 }) catch return;
+                    continue;
+                }
+
+                // Tier 2: globally unique name (non-test).
+                var chosen: ?codegraph.NodeId = null;
+                var count: usize = 0;
+                for (cands) |to| {
+                    if (to == f.id) continue;
+                    if (isLikelyTestPath(node_path.items[to])) continue;
+                    if (!sameLangFamily(caller_lang, detectLanguage(node_path.items[to]))) continue;
+                    count += 1;
+                    if (count > 1) break;
+                    chosen = to;
+                }
+                if (count == 1) {
+                    edges_tmp.append(a, .{ .from = f.id, .to = chosen.?, .weight = 1.0 }) catch return;
+                }
+            }
+        }
         defer edges_tmp.deinit(a);
 
         const edges_owned = self.allocator.alloc(codegraph.Edge, edges_tmp.items.len) catch return;
@@ -4956,6 +5180,52 @@ pub const Explorer = struct {
             try steps.append(allocator, .{
                 .path = cg.node_path[nid],
                 .name = cg.node_name[nid],
+                .line = cg.node_line[nid],
+            });
+        }
+        return try steps.toOwnedSlice(allocator);
+    }
+
+    /// Resolved callers of a symbol name — every function/method that calls it.
+    /// Fail-closed: returns empty when the name is missing or ambiguous (>1
+    /// definition), so a bare-name collision never merges unrelated functions.
+    pub fn callersOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) ![]CallPathStep {
+        return self.neighborsOf(name, allocator, max, true);
+    }
+
+    /// Resolved callees of a symbol name — every function/method it calls.
+    /// Same fail-closed ambiguity rule as callersOf.
+    pub fn calleesOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) ![]CallPathStep {
+        return self.neighborsOf(name, allocator, max, false);
+    }
+
+    fn neighborsOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize, reverse: bool) ![]CallPathStep {
+        if (max == 0) return &.{};
+        self.ensureSymbolIndex();
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        self.ensureCallGraph(allocator);
+        const cg = self.call_graph orelse return &.{};
+
+        var target: ?codegraph.NodeId = null;
+        var matches: usize = 0;
+        for (cg.node_name, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) {
+                matches += 1;
+                if (matches > 1) return &.{}; // ambiguous — fail closed
+                target = @intCast(i);
+            }
+        }
+        const id = target orelse return &.{};
+
+        const adj = if (reverse) cg.radj else cg.adj;
+        var steps: std.ArrayList(CallPathStep) = .empty;
+        errdefer steps.deinit(allocator);
+        for (adj[id].items) |nid| {
+            if (steps.items.len >= max) break;
+            try steps.append(allocator, .{
+                .path = try allocator.dupe(u8, cg.node_path[nid]),
+                .name = try allocator.dupe(u8, cg.node_name[nid]),
                 .line = cg.node_line[nid],
             });
         }

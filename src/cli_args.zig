@@ -8,7 +8,7 @@ const std = @import("std");
 /// three hand-maintained copies drifting: cliIsQueryCmd, isCommand, and the
 /// runQuery dispatch chain in mainImpl). isCommand appends the non-query
 /// commands; the dispatch chain calls cliIsQueryCmd directly.
-pub const cli_query_cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
+pub const cli_query_cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callees", "callpath", "deps", "glob", "ls", "file" };
 
 /// Editors that don't expand the placeholder pass the literal token as the
 /// root. #639: normalized here (not in mainImpl) so it lands before the
@@ -241,13 +241,8 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    // cli_query_cmds is the shared query-command table (see its doc); only the
-    // non-query commands are listed here.
-    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon", "index" };
-    for (commands) |c| {
-        if (std.mem.eql(u8, arg, c)) return true;
-    }
-    return false;
+    // Every supported command is a read-only query command in this fork.
+    return cliIsQueryCmd(arg);
 }
 
 pub fn resolveRoot(io: std.Io, root: []const u8, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {

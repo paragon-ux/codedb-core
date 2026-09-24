@@ -18,9 +18,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── CLI executable ──
-    // In ReleaseFast/Small, strip debug info to shrink the binary (~10%)
-    // and the RSS at runtime (smaller __TEXT footprint = fewer pages
-    // resident under load). Debug/ReleaseSafe keep symbols for stack traces.
+    // In ReleaseFast/Small, strip debug info to shrink the binary (~10%).
     const strip_debug = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const exe = b.addExecutable(.{
         .name = "codedb",
@@ -33,19 +31,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // ── mcp-zig dependency ──
-    const mcp_dep = b.dependency("mcp_zig", .{});
-    exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
-
     // ── nanoregex dependency ──
     const nanoregex_dep = b.dependency("nanoregex", .{});
     exe.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
+    codedb_mod.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
 
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
 
-    // Zig 0.16 x86_64-macos binaries can segfault on macOS 26 after codesign
-    // (issue #504), including under Rosetta. Keep that release slice unsigned.
+    // macOS codesign, skipped for x86_64 (see upstream issue #504).
     if (codesign_identity) |identity| {
         const target_os = target.query.os_tag orelse target.result.os.tag;
         const target_arch = target.query.cpu_arch orelse target.result.cpu.arch;
@@ -69,50 +63,10 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Run codedb daemon");
+    const run_step = b.step("run", "Run codedb");
     run_step.dependOn(&run_cmd.step);
 
-    // ── Tests (split into independent binaries for faster compilation) ──
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
-    const test_step = b.step("test", "Run all tests");
-
-    const test_files = [_]struct { name: []const u8, path: []const u8, needs_mcp: bool, needs_nanoregex: bool }{
-        .{ .name = "test-core",     .path = "src/test_core.zig",     .needs_mcp = false, .needs_nanoregex = false },
-        .{ .name = "test-explore",  .path = "src/test_explore.zig",  .needs_mcp = false, .needs_nanoregex = true },
-        .{ .name = "test-index",    .path = "src/test_index.zig",    .needs_mcp = true,  .needs_nanoregex = true },
-        .{ .name = "test-parser",   .path = "src/test_parser.zig",   .needs_mcp = false, .needs_nanoregex = true },
-        .{ .name = "test-search",   .path = "src/test_search.zig",   .needs_mcp = true,  .needs_nanoregex = true },
-        .{ .name = "test-snapshot", .path = "src/test_snapshot.zig", .needs_mcp = false, .needs_nanoregex = true },
-        .{ .name = "test-mcp",      .path = "src/test_mcp.zig",      .needs_mcp = true,  .needs_nanoregex = true },
-        .{ .name = "test-query",    .path = "src/test_query.zig",    .needs_mcp = true,  .needs_nanoregex = true },
-        .{ .name = "test-bench",    .path = "src/test_bench.zig",    .needs_mcp = false, .needs_nanoregex = true },
-    };
-
-    for (test_files) |tf| {
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(tf.path),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-        if (tf.needs_mcp) t.root_module.addImport("mcp", mcp_dep.module("mcp"));
-        if (tf.needs_nanoregex) t.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-        if (test_filter) |f| {
-            const filters = b.allocator.alloc([]const u8, 1) catch @panic("oom");
-            filters[0] = f;
-            t.filters = filters;
-        }
-        const run = b.addRunArtifact(t);
-        test_step.dependOn(&run.step);
-
-        const individual_step = b.step(tf.name, b.fmt("Run {s}", .{tf.name}));
-        individual_step.dependOn(&run.step);
-    }
-
-
-    // ── Library tests (verify the module root compiles) ──
+    // ── Tests (verify the module root and the deterministic core compile) ──
     const lib_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lib.zig"),
@@ -121,93 +75,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    lib_tests.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
+    const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
-
-    // ── Adversarial tests ──
-    const adversarial_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/adversarial_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    adversarial_tests.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    test_step.dependOn(&b.addRunArtifact(adversarial_tests).step);
-
-
-    // ── Benchmarks ──
-    const bench = b.addExecutable(.{
-        .name = "bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .link_libc = true,
-        }),
-    });
-    const bench_run = b.addRunArtifact(bench);
-    bench.root_module.addImport("mcp", mcp_dep.module("mcp"));
-    bench.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    if (b.args) |args| bench_run.addArgs(args);
-    const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&bench_run.step);
-
-    // ── Edge-case benchmarks (synthetic pathological corpus) ──
-    const bench_edge = b.addExecutable(.{
-        .name = "bench-edge",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_edge.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .link_libc = true,
-        }),
-    });
-    bench_edge.root_module.addImport("mcp", mcp_dep.module("mcp"));
-    bench_edge.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    const bench_edge_run = b.addRunArtifact(bench_edge);
-    if (b.args) |args| bench_edge_run.addArgs(args);
-    const bench_edge_step = b.step("bench-edge", "Run edge-case benchmarks (synthetic pathological corpus)");
-    bench_edge_step.dependOn(&bench_edge_run.step);
-
-    // ── Benchmark (repo benchmark — indexing speed, query latency, recall) ──
-    const benchmark = b.addExecutable(.{
-        .name = "benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/benchmark.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .link_libc = true,
-        }),
-    });
-    benchmark.root_module.addImport("mcp", mcp_dep.module("mcp"));
-    benchmark.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    const benchmark_run = b.addRunArtifact(benchmark);
-    if (b.args) |args| benchmark_run.addArgs(args);
-    const benchmark_step = b.step("benchmark", "Run repo benchmark (use -- --root /path/to/repo)");
-    benchmark_step.dependOn(&benchmark_run.step);
-
-    // Make module available so dependents don't need to wire it up manually
-    _ = codedb_mod;
-
-    // ── WASM build (for Cloudflare Workers) ──
-    const wasm = b.addExecutable(.{
-        .name = "codedb",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .wasm32,
-                .os_tag = .freestanding,
-            }),
-            .optimize = .ReleaseSmall,
-        }),
-    });
-    wasm.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    wasm.rdynamic = true;
-    wasm.entry = .disabled;
-
-    const wasm_step = b.step("wasm", "Build WASM module for Cloudflare Workers");
-    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{
-        .dest_dir = .{ .override = .{ .custom = "../wasm" } },
-    }).step);
 }

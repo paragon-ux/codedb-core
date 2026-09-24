@@ -30,3 +30,9 @@ logs/
 # Dependency / tooling caches
 zig-pkg/
 __pycache__/
+
+# npm / node tooling
+node_modules/
+
+# Prebuilt platform binaries (built at prepack; dist/index.js is source)
+dist/codedb-*

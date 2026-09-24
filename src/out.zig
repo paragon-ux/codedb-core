@@ -58,82 +58,27 @@ pub const Out = struct {
 };
 
 pub fn printUsage(out: *Out, s: sty.Style) void {
-    out.p(
-        \\
-        \\{s}codedb{s}  code intelligence server
-        \\
-        \\  {s}usage:{s} codedb [root] <command> [args...]
-        \\
-        \\  {s}commands:{s}
-        \\    {s}tree{s}                      show file tree with language and symbol counts
-        \\    {s}outline{s} {s}<path>{s}         list all symbols in a file
-        \\    {s}find{s}    {s}<name>{s}         find where a symbol is defined
-        \\    {s}search{s}  {s}<query>{s}        full-text search (trigram, case-insensitive)
-        \\    {s}word{s}    {s}<identifier>{s}   exact word lookup via inverted index
-        \\    {s}read{s}    {s}<path>{s}         file contents (optionally -L FROM-TO, --compact)
-        \\
-    , .{
-        s.bold, s.reset,
-        s.dim,  s.reset,
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-    });
-    out.p(
-        \\    {s}hot{s}                       recently modified files
-        \\    {s}status{s}                    index size, store seq, and index state
-        \\    {s}symbol{s}  <name>            where a symbol is defined (all matches; --body for source)
-        \\    {s}callers{s}  <name>           every call site of a symbol
-        \\    {s}deps{s}  <path>              dependency graph (--depends-on, --transitive, --max-depth N)
-        \\    {s}glob{s}  <pattern>           match indexed paths by glob
-        \\    {s}ls{s}  [path]                list a directory's indexed children
-        \\    {s}file{s}  <fuzzy-name>        fuzzy file-name search
-        \\    {s}context{s}  <task...>        task-shaped orientation bundle
-        \\    {s}serve{s}                     HTTP daemon on :7719
-        \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
-        \\    {s}update{s}                    self-update to the latest verified release
-        \\    {s}nuke{s}                      uninstall codedb, clear caches, and deregister integrations
-        \\
-    , .{
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-    });
-    out.p(
-        \\  {s}options:{s}
-        \\    {s}--no-telemetry{s}             disable usage telemetry (or set CODEDB_NO_TELEMETRY)
-        \\    {s}--config-file <path>{s}       load config overrides from <path> (default: ./.codedbrc)
-        \\
-        \\  If root is omitted, uses current working directory.
-        \\  Data stored in {s}~/.codedb/projects/<hash>/{s}
-        \\
-        \\  exit codes: 0 = success (incl. a valid query that finds nothing),
-        \\              1 = usage error, invalid input, or operational failure.
-        \\
-        \\
-    , .{
-        s.dim,  s.reset,
-        s.cyan, s.reset,
-        s.cyan, s.reset,
-        s.dim,  s.reset,
-    });
+    out.p("{s}codedb{s}  deterministic structural code intelligence\n", .{ s.bold, s.reset });
+    out.p("{s}usage:{s} codedb [root] <command> [args...]\n\n", .{ s.dim, s.reset });
+    out.p("{s}commands:{s}\n", .{ s.dim, s.reset });
+    out.p("  {s}tree{s}          show file tree with language and symbol counts\n", .{ s.cyan, s.reset });
+    out.p("  {s}outline{s} <p>   list all symbols in a file\n", .{ s.cyan, s.reset });
+    out.p("  {s}find{s} <n>      find where a symbol is defined\n", .{ s.cyan, s.reset });
+    out.p("  {s}symbol{s} <n>    find symbol definitions (ranked)\n", .{ s.cyan, s.reset });
+    out.p("  {s}callers{s} <n>   resolved callers of a symbol (fail-closed)\n", .{ s.cyan, s.reset });
+    out.p("  {s}callees{s} <n>   resolved callees of a symbol (fail-closed)\n", .{ s.cyan, s.reset });
+    out.p("  {s}callpath{s} a b  shortest resolved call chain\n", .{ s.cyan, s.reset });
+    out.p("  {s}deps{s} <p>      dependency graph (--depends-on)\n", .{ s.cyan, s.reset });
+    out.p("  {s}search{s} <q>    full-text search (trigram, case-insensitive)\n", .{ s.cyan, s.reset });
+    out.p("  {s}word{s} <id>     exact word lookup via inverted index\n", .{ s.cyan, s.reset });
+    out.p("  {s}read{s} <p>      file contents (-L FROM-TO, --compact)\n", .{ s.cyan, s.reset });
+    out.p("  {s}glob{s} <pat>    match indexed paths by glob\n", .{ s.cyan, s.reset });
+    out.p("  {s}ls{s} [p]        list a directory's indexed children\n", .{ s.cyan, s.reset });
+    out.p("  {s}hot{s}           recently modified files\n", .{ s.cyan, s.reset });
+    out.p("  {s}status{s}        index size and store seq\n", .{ s.cyan, s.reset });
+    out.p("\n{s}options:{s}\n", .{ s.dim, s.reset });
+    out.p("  {s}--json{s}          emit machine-readable JSON (all query commands)\n", .{ s.cyan, s.reset });
+    out.p("  {s}--config-file <p>{s} load config overrides (default: ./.codedbrc)\n\n", .{ s.cyan, s.reset });
+    out.p("If root is omitted, uses current working directory.\n", .{});
+    out.p("exit codes: 0 = success, 1 = usage error or operational failure.\n", .{});
 }
