@@ -1,5 +1,11 @@
 # @paragon-ux/codedb-core
 
+## 1.0.1
+
+- Expose `./package.json` in the package `exports` so consumers can
+  `require.resolve("@paragon-ux/codedb-core/package.json")` (the pattern
+  waymark-engine's bundled-binary resolver uses).
+
 ## 1.0.0
 
 Initial fork of `justrach/codedb` frozen at `428d8df` (v0.2.5826), Zig 0.16.0.
