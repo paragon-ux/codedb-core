@@ -1,10 +1,10 @@
 name: build-macos
 
+# Manual-only: macOS binaries are built once per release and collected into
+# dist/. Trigger by hand via the Actions tab (or `gh workflow run build-macos`)
+# when a new release needs fresh darwin binaries.
 on:
   workflow_dispatch:
-  push:
-    branches: [freeze-0.16, main]
-    tags: ["v*"]
 
 permissions:
   contents: read
