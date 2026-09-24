@@ -10,10 +10,16 @@ binary, one scan, one deterministic answer.
 
 ## Why this fork
 
-`codedb` is an excellent engine, but its surface grew to include an ANN
-embedding layer, a hosted semantic composer, telemetry, cloud auth, a
-Web/DeepWiki remote, and long-lived MCP/HTTP daemons. This fork removes all
-of that and keeps only the parts that answer a query *deterministically*:
+waymark-engine's symbolic tier needed a real call graph. Its hand-rolled
+Tree-sitter walker had three structural defects — `src/`-only scanning,
+bare-name call-graph collisions, and node-type string-matching gaps — that
+codedb fixes natively (repo-root scanning, a resolved call graph, proper
+per-language node extraction).
+
+But codedb's own surface also grew to include an ANN embedding layer, a hosted
+semantic composer, telemetry, cloud auth, a Web/DeepWiki remote, and long-lived
+MCP/HTTP daemons. This fork removes all of that and keeps only the parts that
+answer a query *deterministically*:
 
 - `outline` — every symbol in a file.
 - `symbol` / `find` — where a symbol is defined (ranked, exact/prefix/glob).
