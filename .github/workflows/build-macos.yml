@@ -1,0 +1,42 @@
+name: build-macos
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [freeze-0.16, main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  darwin:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-macos
+            name: codedb-darwin-x64
+          - target: aarch64-macos
+            name: codedb-darwin-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp zig-out/bin/codedb "${{ matrix.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          if-no-files-found: error
