@@ -65,6 +65,13 @@ pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
 
+    const TemplateFrame = struct {
+        in_interp: bool = false,
+        interp_depth: usize = 0,
+    };
+    var t_stack: [16]TemplateFrame = undefined;
+    var t_depth: usize = 0;
+
     var i: usize = 0;
     while (i < body.len) : (i += 1) {
         const c = body[i];
@@ -84,11 +91,53 @@ pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const
         if (c == '"' or c == '\'') {
             i += 1;
             while (i < body.len and body[i] != c) {
-                if (body[i] == '\\') i += 1; // skip an escaped char
+                if (body[i] == '\\' and i + 1 < body.len) i += 1; // skip an escaped char
                 i += 1;
             }
             continue;
         }
+
+        // Inside a template literal's literal text span (not currently in an ${...} interpolation)
+        if (t_depth > 0 and !t_stack[t_depth - 1].in_interp) {
+            if (c == '\\') {
+                if (i + 1 < body.len) i += 1; // skip escaped char (e.g. \` or \${)
+                continue;
+            }
+            if (c == '`') {
+                t_depth -= 1; // template ended
+                continue;
+            }
+            if (c == '$' and i + 1 < body.len and body[i + 1] == '{') {
+                i += 1; // advance to '{'
+                t_stack[t_depth - 1].in_interp = true;
+                t_stack[t_depth - 1].interp_depth = 0;
+                continue;
+            }
+            continue; // skip literal characters in template text
+        }
+
+        // Outside template, or inside `${...}` interpolation:
+        if (c == '`') {
+            if (t_depth < t_stack.len) {
+                t_stack[t_depth] = .{ .in_interp = false, .interp_depth = 0 };
+                t_depth += 1;
+            }
+            continue;
+        }
+
+        if (t_depth > 0 and t_stack[t_depth - 1].in_interp) {
+            if (c == '{') {
+                t_stack[t_depth - 1].interp_depth += 1;
+            } else if (c == '}') {
+                if (t_stack[t_depth - 1].interp_depth == 0) {
+                    t_stack[t_depth - 1].in_interp = false;
+                    continue;
+                } else {
+                    t_stack[t_depth - 1].interp_depth -= 1;
+                }
+            }
+        }
+
         if (c != '(') continue;
         // Skip spaces/tabs between the identifier and the '('.
         var end = i;
@@ -306,3 +355,76 @@ pub fn shortestCallPath(
 
     return null;
 }
+
+test "extractCallees template literal and comments" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // 1. Literal text call-shaped fragment ignored
+    {
+        const body = "const msg = `run validate() before commit`;";
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 0), callees.len);
+    }
+
+    // 2. Real call inside interpolation
+    {
+        const body = "const msg = `Hello ${targetCall()} world`;";
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 1), callees.len);
+        try testing.expectEqualStrings("targetCall", callees[0]);
+    }
+
+    // 3. Multiline with both literal text and real interpolation
+    {
+        const body =
+            \\function render() {
+            \\    const doc = `
+            \\      This is notACall() here.
+            \\      ${realCall(123)}
+            \\      and neither is thisOtherNotCall()
+            \\    `;
+            \\    return doc;
+            \\}
+        ;
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 1), callees.len);
+        try testing.expectEqualStrings("realCall", callees[0]);
+    }
+
+    // 4. Nested interpolation
+    {
+        const body = "const str = `outer ${a ? `${nestedCall()}` : otherCall()} end`;";
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 2), callees.len);
+        var has_nested = false;
+        var has_other = false;
+        for (callees) |c| {
+            if (std.mem.eql(u8, c, "nestedCall")) has_nested = true;
+            if (std.mem.eql(u8, c, "otherCall")) has_other = true;
+        }
+        try testing.expect(has_nested and has_other);
+    }
+
+    // 5. Object literal inside interpolation
+    {
+        const body = "const val = `val: ${ { x: objCall() } }`;";
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 1), callees.len);
+        try testing.expectEqualStrings("objCall", callees[0]);
+    }
+
+    // 6. Escapes
+    {
+        const body = "const esc = `\\${fakeCall()} and \\` stillNotCall()`;";
+        const callees = try extractCallees(alloc, body);
+        defer alloc.free(callees);
+        try testing.expectEqual(@as(usize, 0), callees.len);
+    }
+}
+

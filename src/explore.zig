@@ -703,6 +703,8 @@ pub const CallGraph = struct {
     node_path: []const []const u8,
     node_name: []const []const u8,
     node_line: []const u32,
+    node_dropped_ambiguous_callers: []const u32,
+    node_dropped_ambiguous_callees: []const u32,
 
     pub fn deinit(self: *CallGraph, allocator: std.mem.Allocator) void {
         allocator.free(self.edges);
@@ -713,6 +715,8 @@ pub const CallGraph = struct {
         for (self.node_name) |n| allocator.free(n);
         allocator.free(self.node_name);
         allocator.free(self.node_line);
+        allocator.free(self.node_dropped_ambiguous_callers);
+        allocator.free(self.node_dropped_ambiguous_callees);
     }
 };
 
@@ -4960,6 +4964,11 @@ pub const Explorer = struct {
         //   2. globally-unique name.
         // Every tier keeps the fail-closed rule: ambiguity emits no edge, so
         // `adj`/`radj` never fan out a bare-name collision to unrelated code.
+        var dropped_callees = a.alloc(u32, n_nodes) catch return;
+        @memset(dropped_callees, 0);
+        var dropped_callers = a.alloc(u32, n_nodes) catch return;
+        @memset(dropped_callers, 0);
+
         var edges_tmp: std.ArrayList(codegraph.Edge) = .empty;
         for (funcs.items) |f| {
             const caller_path = node_path.items[f.id];
@@ -4999,6 +5008,15 @@ pub const Explorer = struct {
                 }
                 if (count == 1) {
                     edges_tmp.append(a, .{ .from = f.id, .to = chosen.?, .weight = 1.0 }) catch return;
+                } else if (count > 1 or same_count > 1) {
+                    dropped_callees[f.id] += 1;
+                    for (cands) |to| {
+                        if (to != f.id and !isLikelyTestPath(node_path.items[to]) and
+                            sameLangFamily(caller_lang, detectLanguage(node_path.items[to])))
+                        {
+                            dropped_callers[to] += 1;
+                        }
+                    }
                 }
             }
         }
@@ -5115,6 +5133,33 @@ pub const Explorer = struct {
             self.call_centrality = cmap;
         }
 
+        const d_callers = self.allocator.alloc(u32, n_nodes) catch {
+            self.allocator.free(edges_owned);
+            codegraph.freeAdjacency(self.allocator, adj);
+            codegraph.freeAdjacency(self.allocator, radj);
+            for (np) |s| self.allocator.free(s);
+            self.allocator.free(np);
+            for (nn) |s| self.allocator.free(s);
+            self.allocator.free(nn);
+            self.allocator.free(nl);
+            return;
+        };
+        @memcpy(d_callers, dropped_callers);
+
+        const d_callees = self.allocator.alloc(u32, n_nodes) catch {
+            self.allocator.free(edges_owned);
+            codegraph.freeAdjacency(self.allocator, adj);
+            codegraph.freeAdjacency(self.allocator, radj);
+            for (np) |s| self.allocator.free(s);
+            self.allocator.free(np);
+            for (nn) |s| self.allocator.free(s);
+            self.allocator.free(nn);
+            self.allocator.free(nl);
+            self.allocator.free(d_callers);
+            return;
+        };
+        @memcpy(d_callees, dropped_callees);
+
         self.call_graph = .{
             .edges = edges_owned,
             .adj = adj,
@@ -5122,6 +5167,8 @@ pub const Explorer = struct {
             .node_path = np,
             .node_name = nn,
             .node_line = nl,
+            .node_dropped_ambiguous_callers = d_callers,
+            .node_dropped_ambiguous_callees = d_callees,
         };
         // The graph-distance boost gate (`call_graph != null`) just flipped:
         // results cached before the build could differ from a fresh search.
@@ -5186,37 +5233,63 @@ pub const Explorer = struct {
         return try steps.toOwnedSlice(allocator);
     }
 
+    pub const StepsWithStats = struct {
+        steps: []CallPathStep,
+        dropped_callers: u32,
+        dropped_callees: u32,
+    };
+
+    pub const NeighborResult = struct {
+        callers: []CallPathStep,
+        callees: []CallPathStep,
+        symbol_exists: bool,
+        ambiguous: bool,
+        candidates: []ScoredSymbolResult,
+        dropped_callers: u32,
+        dropped_callees: u32,
+    };
+
     /// Resolved callers of a symbol name — every function/method that calls it.
     /// Fail-closed: returns empty when the name is missing or ambiguous (>1
     /// definition), so a bare-name collision never merges unrelated functions.
     pub fn callersOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) ![]CallPathStep {
-        return self.neighborsOf(name, allocator, max, true);
+        const res = try self.neighborsOfWithStats(name, allocator, max, true);
+        return res.steps;
     }
 
     /// Resolved callees of a symbol name — every function/method it calls.
     /// Same fail-closed ambiguity rule as callersOf.
     pub fn calleesOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) ![]CallPathStep {
-        return self.neighborsOf(name, allocator, max, false);
+        const res = try self.neighborsOfWithStats(name, allocator, max, false);
+        return res.steps;
     }
 
-    fn neighborsOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize, reverse: bool) ![]CallPathStep {
-        if (max == 0) return &.{};
+    pub fn callersOfWithStats(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) !StepsWithStats {
+        return self.neighborsOfWithStats(name, allocator, max, true);
+    }
+
+    pub fn calleesOfWithStats(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) !StepsWithStats {
+        return self.neighborsOfWithStats(name, allocator, max, false);
+    }
+
+    fn neighborsOfWithStats(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize, reverse: bool) !StepsWithStats {
+        if (max == 0) return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 };
         self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
         self.ensureCallGraph(allocator);
-        const cg = self.call_graph orelse return &.{};
+        const cg = self.call_graph orelse return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 };
 
         var target: ?codegraph.NodeId = null;
         var matches: usize = 0;
         for (cg.node_name, 0..) |n, i| {
             if (std.mem.eql(u8, n, name)) {
                 matches += 1;
-                if (matches > 1) return &.{}; // ambiguous — fail closed
+                if (matches > 1) return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 }; // ambiguous — fail closed
                 target = @intCast(i);
             }
         }
-        const id = target orelse return &.{};
+        const id = target orelse return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 };
 
         const adj = if (reverse) cg.radj else cg.adj;
         var steps: std.ArrayList(CallPathStep) = .empty;
@@ -5229,7 +5302,118 @@ pub const Explorer = struct {
                 .line = cg.node_line[nid],
             });
         }
-        return try steps.toOwnedSlice(allocator);
+        return .{
+            .steps = try steps.toOwnedSlice(allocator),
+            .dropped_callers = cg.node_dropped_ambiguous_callers[id],
+            .dropped_callees = cg.node_dropped_ambiguous_callees[id],
+        };
+    }
+
+    pub fn bothNeighborsOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) !NeighborResult {
+        if (max == 0) return .{
+            .callers = &.{},
+            .callees = &.{},
+            .symbol_exists = false,
+            .ambiguous = false,
+            .candidates = &.{},
+            .dropped_callers = 0,
+            .dropped_callees = 0,
+        };
+        self.ensureSymbolIndex();
+        self.mu.lockShared();
+        self.ensureCallGraph(allocator);
+        const cg = self.call_graph;
+
+        var target: ?codegraph.NodeId = null;
+        var matches: usize = 0;
+        if (cg) |graph| {
+            for (graph.node_name, 0..) |n, i| {
+                if (std.mem.eql(u8, n, name)) {
+                    matches += 1;
+                    target = @intCast(i);
+                }
+            }
+        }
+
+        if (matches == 1 and cg != null) {
+            const graph = cg.?;
+            const id = target.?;
+            var callers_list: std.ArrayList(CallPathStep) = .empty;
+            errdefer callers_list.deinit(allocator);
+            for (graph.radj[id].items) |nid| {
+                if (callers_list.items.len >= max) break;
+                try callers_list.append(allocator, .{
+                    .path = try allocator.dupe(u8, graph.node_path[nid]),
+                    .name = try allocator.dupe(u8, graph.node_name[nid]),
+                    .line = graph.node_line[nid],
+                });
+            }
+
+            var callees_list: std.ArrayList(CallPathStep) = .empty;
+            errdefer callees_list.deinit(allocator);
+            for (graph.adj[id].items) |nid| {
+                if (callees_list.items.len >= max) break;
+                try callees_list.append(allocator, .{
+                    .path = try allocator.dupe(u8, graph.node_path[nid]),
+                    .name = try allocator.dupe(u8, graph.node_name[nid]),
+                    .line = graph.node_line[nid],
+                });
+            }
+
+            const d_callers = graph.node_dropped_ambiguous_callers[id];
+            const d_callees = graph.node_dropped_ambiguous_callees[id];
+            self.mu.unlockShared();
+
+            return .{
+                .callers = try callers_list.toOwnedSlice(allocator),
+                .callees = try callees_list.toOwnedSlice(allocator),
+                .symbol_exists = true,
+                .ambiguous = false,
+                .candidates = &.{},
+                .dropped_callers = d_callers,
+                .dropped_callees = d_callees,
+            };
+        }
+
+        self.mu.unlockShared();
+
+        // matches != 1: either ambiguous or missing from the call graph.
+        // Query searchSymbols to distinguish candidate definitions from complete miss.
+        const spec = SymbolSearchSpec{
+            .name = name,
+            .prefix = null,
+            .pattern = null,
+            .kind = null,
+            .fuzzy = false,
+            .max_results = 200,
+        };
+        const cands = try self.searchSymbols(spec, allocator);
+        var callable_count: usize = 0;
+        for (cands) |r| {
+            if (r.symbol.kind == .function or r.symbol.kind == .method) callable_count += 1;
+        }
+
+        if (callable_count > 1 or matches > 1) {
+            return .{
+                .callers = &.{},
+                .callees = &.{},
+                .symbol_exists = true,
+                .ambiguous = true,
+                .candidates = cands,
+                .dropped_callers = 0,
+                .dropped_callees = 0,
+            };
+        }
+
+        return .{
+            .callers = &.{},
+            .callees = &.{},
+            .symbol_exists = cands.len > 0,
+            .ambiguous = false,
+            .candidates = cands,
+            .dropped_callers = 0,
+            .dropped_callees = 0,
+        };
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {

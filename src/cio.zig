@@ -39,7 +39,7 @@ fn write(fd: c_int, ptr: [*]const u8, len: usize) isize {
     return posix_libc.write(fd, ptr, len);
 }
 
-fn read(fd: c_int, ptr: [*]u8, len: usize) isize {
+pub fn read(fd: c_int, ptr: [*]u8, len: usize) isize {
     if (is_windows) return win_libc._read(fd, ptr, @intCast(@min(len, @as(usize, 0x7fff_ffff))));
     return posix_libc.read(fd, ptr, len);
 }
