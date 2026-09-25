@@ -1,6 +1,6 @@
 {
   "name": "@paragon-ux/codedb-core",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Deterministic structural code intelligence — lexical-only fork of codedb: outline, symbol, call graph, and trigram search. No embeddings, no telemetry, no cloud, no daemon.",
   "license": "BSD-3-Clause",
   "author": "paragon-ux (fork of justrach/codedb)",

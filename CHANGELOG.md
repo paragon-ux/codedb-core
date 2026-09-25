@@ -1,5 +1,12 @@
 # @paragon-ux/codedb-core
 
+## 1.0.2
+
+- **Single-pass `neighbors` command**: Combined bidirectional call-graph traversal (`callers` + `callees`) and ambiguity resolution in a single AST indexing pass, cutting query time in half for full adjacency queries.
+- **Template-literal-aware callee extraction (`extractCallees`)**: Introduced a dedicated state machine handling nested backtick template literals (`` `...${...}...` ``) to prevent false-positive callee attributions from strings.
+- **Dropped ambiguous edge metrics**: Added explicit tracking for `node_dropped_ambiguous_callers` and `node_dropped_ambiguous_callees` when non-ubiquitous identifier collisions occur, accompanied by clean Zig allocator memory reclamation in `CallGraph.deinit()`.
+- **Zero-daemon resident server (`serve --stdio`)**: Windows Job Object death-supervised JSON-RPC stdio worker, amortizing the index scan across subsequent resident requests (0.26ms–0.75ms per query).
+
 ## 1.0.1
 
 - Expose `./package.json` in the package `exports` so consumers can
