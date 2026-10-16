@@ -78,7 +78,7 @@ pub fn printUsage(out: *Out, s: sty.Style) void {
     out.p("  {s}status{s}        index size and store seq\n", .{ s.cyan, s.reset });
     out.p("\n{s}options:{s}\n", .{ s.dim, s.reset });
     out.p("  {s}--json{s}          emit machine-readable JSON (all query commands)\n", .{ s.cyan, s.reset });
-    out.p("  {s}--config-file <p>{s} load config overrides (default: ./.codedbrc)\n\n", .{ s.cyan, s.reset });
+    out.p("  {s}--config-file <p>{s} load config overrides (default: ./.codedb-corerc)\n\n", .{ s.cyan, s.reset });
     out.p("If root is omitted, uses current working directory.\n", .{});
     out.p("exit codes: 0 = success, 1 = usage error or operational failure.\n", .{});
 }

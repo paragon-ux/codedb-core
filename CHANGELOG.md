@@ -1,5 +1,28 @@
 # @paragon-ux/codedb-core
 
+## Unreleased
+
+### Own on-disk names; never touch upstream codedb's state
+
+- **No data dir, no `data.log`.** The CLI no longer creates
+  `~/.codedb/projects/<hash>/` (or `<root>/.codedb/` without a home dir) and no
+  longer truncates the `data.log` there on every run. That path belongs to
+  upstream `justrach/codedb`, so each codedb-core call emptied upstream's edit
+  log for the project. Nothing read the file in this one-shot fork, so it is
+  gone rather than moved.
+- **Config is now `.codedb-corerc`** (in `$CWD`, then next to the binary).
+  Upstream's `.codedbrc` is no longer read. Migration: `cp .codedbrc
+  .codedb-corerc`, or pass `--config-file .codedbrc`. Keys are unchanged
+  (`max_versions`, `max_cached`).
+- **Reserved data dir**: `~/.codedb-core/projects/<wyhash(root)>` (or
+  `<root>/.codedb-core`), defined in `src/state_paths.zig`. Nothing creates it
+  today; the scanner skips `.codedb-core/` like `.codedb/`.
+- **Tests**: `zig build test` now runs the config/state-path unit tests and an
+  end-to-end check that builds the CLI and runs `tree`, `outline`, `search`,
+  `symbol`, `callers`, `callees`, `neighbors`, and `status` with a seeded
+  upstream `data.log` and `.codedbrc`, asserting both stay byte-identical and
+  unread.
+
 ## 1.1.0
 
 - **Minor Version Promotion**: Formal release of core intelligence hardening, resident execution mode, and adjacency query acceleration.

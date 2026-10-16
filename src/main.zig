@@ -22,7 +22,6 @@ const query_mod = @import("query.zig");
 const runQuery = query_mod.runQuery;
 const bootstrap = @import("bootstrap.zig");
 const loadUserConfig = bootstrap.loadUserConfig;
-const getDataDir = bootstrap.getDataDir;
 
 /// In Debug builds Zig may merge all command-branch stack frames into one
 /// that overflows the default OS stack, so we trampoline through a thread
@@ -150,9 +149,6 @@ fn mainImpl() !void {
         out.exitWithFlush(1);
     }
 
-    const data_dir = try getDataDir(io, allocator, abs_root);
-    defer allocator.free(data_dir);
-
     const cfg = loadUserConfig(io, allocator, explicit_config) catch |err| blk: {
         std.log.warn("config load failed ({s}) — using defaults", .{@errorName(err)});
         break :blk Config.default;
@@ -161,12 +157,8 @@ fn mainImpl() !void {
     var store = Store.init(allocator);
     store.max_versions = cfg.max_versions;
     defer store.deinit();
-
-    const data_log_path = try std.fmt.allocPrint(allocator, "{s}/data.log", .{data_dir});
-    defer allocator.free(data_log_path);
-    store.openDataLog(io, data_log_path) catch |err| {
-        std.log.warn("could not open data log at {s}: {}", .{ data_log_path, err });
-    };
+    // No data dir and no data.log: nothing persists between runs (see
+    // state_paths.zig), so the store stays in memory.
 
     var explorer = Explorer.init(allocator, cfg.max_cached);
     explorer.setRoot(io, root);

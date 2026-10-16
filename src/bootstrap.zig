@@ -1,7 +1,7 @@
-//! Startup bootstrap for the one-shot CLI: config resolution, data-dir
-//! resolution, and the fresh-scan index build. No snapshot, git-head tracking,
-//! disk persistence, warmup threads, or daemon modes — every invocation scans
-//! the project once and answers the query, then exits.
+//! Startup bootstrap for the one-shot CLI: config resolution and the
+//! fresh-scan index build. No data dir, snapshot, git-head tracking, disk
+//! persistence, warmup threads, or daemon modes — every invocation scans the
+//! project once and answers the query, then exits.
 const std = @import("std");
 const cio = @import("cio.zig");
 const Config = @import("config.zig").Config;
@@ -14,8 +14,8 @@ const sty = @import("style.zig");
 const Out = @import("out.zig").Out;
 
 /// Resolve config from the (already-extracted) --config-file path, falling
-/// back to $CWD/.codedbrc and then <binary_dir>/.codedbrc. Returns the
-/// default Config if nothing is found.
+/// back to $CWD/.codedb-corerc and then <binary_dir>/.codedb-corerc. Returns
+/// the default Config if nothing is found. Never reads upstream's .codedbrc.
 pub fn loadUserConfig(io: std.Io, alloc: std.mem.Allocator, explicit: ?[]const u8) !Config {
     const self_exe: ?[:0]u8 = std.process.executablePathAlloc(io, alloc) catch null;
     defer if (self_exe) |p| alloc.free(p);
@@ -25,20 +25,6 @@ pub fn loadUserConfig(io: std.Io, alloc: std.mem.Allocator, explicit: ?[]const u
     } else null;
 
     return try Config.loadDefault(io, alloc, explicit, bin_dir);
-}
-
-pub fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
-    const hash = std.hash.Wyhash.hash(0, abs_root);
-    const home_env = cio.homeDir() orelse {
-        return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
-    };
-    const home = try allocator.dupe(u8, home_env);
-    defer allocator.free(home);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash });
-    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
-        std.log.warn("could not create data dir {s}: {}", .{ dir, err });
-    };
-    return dir;
 }
 
 /// Fresh-scan index bootstrap for a single query. `search` builds the trigram

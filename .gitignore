@@ -4,6 +4,7 @@ zig-out/
 
 # Local/dev files
 .codedb/
+.codedb-core/
 
 # OS files
 .DS_Store

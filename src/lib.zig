@@ -14,6 +14,8 @@ pub const Store = @import("store.zig").Store;
 pub const ChangeEntry = @import("store.zig").ChangeEntry;
 
 pub const Config = @import("config.zig").Config;
+/// On-disk names owned by codedb-core (never upstream codedb's).
+pub const state_paths = @import("state_paths.zig");
 
 pub const Explorer = @import("explore.zig").Explorer;
 pub const FileOutline = @import("explore.zig").FileOutline;
@@ -35,3 +37,10 @@ pub const FileVersions = @import("version.zig").FileVersions;
 pub const Op = @import("version.zig").Op;
 
 pub const watcher = @import("watcher.zig");
+
+test {
+    // The root's decls are analyzed lazily, so pull in the unit tests that
+    // guard on-disk naming explicitly.
+    _ = @import("state_paths.zig");
+    _ = @import("config.zig");
+}

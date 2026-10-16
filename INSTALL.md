@@ -24,7 +24,7 @@ The fork is pinned to **Zig 0.16.0** (stable). Install it any way you like
 
 ```sh
 zig build -Doptimize=ReleaseFast      # build the current platform
-zig build test                        # compile-check the module surface
+zig build test                        # unit tests + end-to-end state-isolation check
 node scripts/build-all.mjs            # build current platform into dist/
 ```
 
@@ -39,6 +39,16 @@ node scripts/build-all.mjs            # build current platform into dist/
 | `codedb-darwin-arm64`   | build on macOS (`-Dtarget=aarch64-macos`)  | macOS |
 
 macOS targets must be built on macOS (the linker needs the Apple SDK).
+
+`zig build test` also builds the CLI and runs it against a temp project with a
+seeded `~/.codedb/projects/<hash>/data.log` and `.codedbrc`, failing if either
+changes or is read (see `src/state_isolation_test.zig`).
+
+## Configuration and state
+
+The CLI reads an optional `.codedb-corerc` and never creates a data dir. See
+[README → On-disk state](./README.md#on-disk-state), including the migration
+note for `.codedbrc` users.
 
 ### Release process
 

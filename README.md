@@ -71,6 +71,38 @@ codedb . tree --json
 Exit code `0` on success (including a valid query that finds nothing), `1` on
 usage error or operational failure.
 
+## On-disk state
+
+codedb-core keeps nothing on disk. Each run scans the project in memory,
+answers, and exits: it creates no data dir and writes no files. It never reads
+or writes upstream codedb's state (`~/.codedb/`, `<root>/.codedb/`, their
+`data.log`, or `.codedbrc`), so both tools can run on the same project.
+
+|          | codedb-core                                                     | upstream codedb             |
+| -------- | --------------------------------------------------------------- | --------------------------- |
+| Config   | `.codedb-corerc` in the working directory, then next to the binary, or `--config-file <path>` | `.codedbrc` |
+| Data dir | none; reserved for future use: `~/.codedb-core/projects/<hash>` (`<root>/.codedb-core` without a home dir) | `~/.codedb/projects/<hash>` |
+
+The config is one `key = value` per line (`#` comments). Known keys:
+`max_versions` and `max_cached`; unknown keys are ignored. The scanner still
+honors a project's `.codedbignore`, read-only.
+
+### Migrating from `.codedbrc`
+
+Up to 1.1.0 the CLI read `./.codedbrc` (upstream's name). It no longer does.
+Rename or copy the file, or point at it explicitly:
+
+```sh
+cp .codedbrc .codedb-corerc
+codedb --config-file .codedbrc . tree
+```
+
+Up to 1.1.0 the CLI also created `~/.codedb/projects/<hash>/` and truncated
+the `data.log` there on every run, which emptied upstream codedb's edit log for
+any project both tools touched. If you never ran upstream codedb, the
+`~/.codedb/` directory came from codedb-core and holds only empty `data.log`
+files, so you can delete it.
+
 ## Freeze
 
 This fork is pinned to upstream commit `428d8df` (v0.2.5826), the last commit

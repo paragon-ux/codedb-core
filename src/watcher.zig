@@ -199,6 +199,7 @@ const skip_dirs = [_][]const u8{
     ".git",
     ".claude",
     ".codedb",
+    ".codedb-core",
     "node_modules",
     ".zig-cache",
     "zig-out",

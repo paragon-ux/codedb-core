@@ -22,7 +22,7 @@ pub const Store = struct {
     data_log: ?std.Io.File = null,
     data_log_pos: u64 = 0,
     io: ?std.Io = null,
-    /// Cap per-file version history. Configurable via .codedbrc (#101).
+    /// Cap per-file version history. Configurable via .codedb-corerc (#101).
     max_versions: usize = 100,
     /// Compact the diff data log once it exceeds this and at least half of it
     /// is orphaned bytes (#597).
@@ -130,7 +130,7 @@ pub const Store = struct {
         });
 
         // Cap version history to prevent unbounded growth. User-configurable
-        // via .codedbrc (see #101).
+        // via .codedb-corerc (see #101).
         const max_versions = self.max_versions;
         if (entry.value_ptr.versions.items.len > max_versions) {
             const excess = entry.value_ptr.versions.items.len - max_versions;

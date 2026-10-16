@@ -1,11 +1,15 @@
 const std = @import("std");
+const config_file_name = @import("state_paths.zig").config_file_name;
 
-/// User-tunable config loaded from .codedbrc files.
+/// User-tunable config loaded from .codedb-corerc files.
 ///
 /// Resolution order (first match wins):
 ///   1. --config-file=<path>  (explicit)
-///   2. $CWD/.codedbrc
-///   3. <binary_dir>/.codedbrc
+///   2. $CWD/.codedb-corerc
+///   3. <binary_dir>/.codedb-corerc
+///
+/// Upstream codedb's .codedbrc is never read implicitly; pass it with
+/// --config-file to reuse it.
 ///
 /// Format: one `key = value` per line. Blank lines and `#`-prefixed lines
 /// are ignored. Unknown keys are silently ignored so upgrades don't break
@@ -17,9 +21,10 @@ pub const Config = struct {
     max_versions: usize = 100,
     /// Cap on files kept in the Explorer's in-memory content cache. Default 16384.
     max_cached: u32 = 16384,
-    /// When true, append one JSON line per searchContent invocation to
-    /// <data_dir>/rerank-traces.jsonl. v0 logger for offline rerank-tuning
-    /// experiments. Off by default — opt in via .codedbrc.
+    /// Library-only: when an embedder sets Explorer.rerank_trace_path, append
+    /// one JSON line per searchContent invocation there (v0 logger for offline
+    /// rerank-tuning experiments). The one-shot CLI parses the key but never
+    /// sets a trace path, so it writes no trace file.
     rerank_trace: bool = false,
 
     pub const default: Config = .{};
@@ -75,14 +80,14 @@ pub const Config = struct {
     ) !Config {
         if (explicit_path) |p| return try loadFromPath(io, alloc, p);
 
-        // Step 2: $CWD/.codedbrc
+        // Step 2: $CWD/.codedb-corerc
         if (cwdConfigExists(io)) {
-            return try loadFromPath(io, alloc, ".codedbrc");
+            return try loadFromPath(io, alloc, config_file_name);
         }
 
-        // Step 3: <binary_dir>/.codedbrc
+        // Step 3: <binary_dir>/.codedb-corerc
         if (binary_dir) |bd| {
-            const path = try std.fmt.allocPrint(alloc, "{s}/.codedbrc", .{bd});
+            const path = try std.fmt.allocPrint(alloc, "{s}/" ++ config_file_name, .{bd});
             defer alloc.free(path);
             return try loadFromPath(io, alloc, path);
         }
@@ -91,7 +96,7 @@ pub const Config = struct {
     }
 
     fn cwdConfigExists(io: std.Io) bool {
-        const f = std.Io.Dir.cwd().openFile(io, ".codedbrc", .{}) catch return false;
+        const f = std.Io.Dir.cwd().openFile(io, config_file_name, .{}) catch return false;
         f.close(io);
         return true;
     }

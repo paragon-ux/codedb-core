@@ -78,4 +78,18 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    // ── End-to-end: the CLI never touches upstream codedb's on-disk state ──
+    const state_opts = b.addOptions();
+    state_opts.addOptionPath("codedb_exe", exe.getEmittedBin());
+    const state_tests = b.addTest(.{
+        .name = "state-isolation",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/state_isolation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    state_tests.root_module.addOptions("build_options", state_opts);
+    test_step.dependOn(&b.addRunArtifact(state_tests).step);
 }
