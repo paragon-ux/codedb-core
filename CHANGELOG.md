@@ -1,5 +1,10 @@
 # @paragon-ux/codedb-core
 
+## 2.0.1
+
+- **Prebuilt binaries are executable again.** In 1.1.0 and 2.0.0, the macOS and Linux binaries in `dist/` shipped without the executable bit, so running `bin/codedb` directly on those platforms failed with a permission error. Hosts that `chmod` the binary before running it, such as waymark-engine, were unaffected. The binaries and code are otherwise unchanged from 2.0.0.
+- **Released from CI.** `.github/workflows/release.yml` now builds all five binaries (macOS on macOS runners), checks the tarball, and publishes with npm Trusted Publishing and provenance whenever a `v*` tag is pushed. Run it manually with `dry_run` to rehearse a release without publishing.
+
 ## 2.0.0
 
 **Breaking:** the config file is now `.codedb-corerc`, and `.codedbrc` is no longer read automatically. If you tuned `.codedbrc`, rename it or pass `--config-file .codedbrc`. Queries and output are unchanged.
