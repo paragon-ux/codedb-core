@@ -72,7 +72,13 @@ jobs:
         if: matrix.smoke
         run: |
           chmod +x "${{ matrix.name }}"
-          "./${{ matrix.name }}" --version
+          expected="codedb $(node -p "require('./package.json').version")"
+          actual="$("./${{ matrix.name }}" --version)"
+          echo "${actual}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::${{ matrix.name }} --version printed '${actual}', expected '${expected}' (package.json)"
+            exit 1
+          fi
           "./${{ matrix.name }}" . outline src/state_paths.zig
 
       - name: Upload artifact

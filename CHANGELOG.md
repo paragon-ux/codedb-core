@@ -1,5 +1,12 @@
 # @paragon-ux/codedb-core
 
+## 2.0.2
+
+- **`codedb --version` reports this package's version.** Through 2.0.1 it printed `codedb 0.2.5828`, a constant inherited from upstream `justrach/codedb`. `build.zig` now reads `version` from `package.json` and builds it into the binary, so the two can't drift; a missing or non-semver version fails the build. Queries and output are otherwise unchanged.
+- **Tests**: `zig build test` builds the CLI and checks that `--version`, `-v`, `version`, and `<root> --version` all print `codedb <package.json version>`.
+- **Release check**: `.github/workflows/release.yml` fails if the smoke-run `codedb-linux-x64` or `codedb-darwin-arm64` binary's `--version` doesn't match `package.json`.
+- `build.zig.zon` lists `package.json` in `paths`, since `build.zig` now reads it.
+
 ## 2.0.1
 
 - **Prebuilt binaries are executable again.** In 1.1.0 and 2.0.0, the macOS and Linux binaries in `dist/` shipped without the executable bit, so running `bin/codedb` directly on those platforms failed with a permission error. Hosts that `chmod` the binary before running it, such as waymark-engine, were unaffected. The binaries and code are otherwise unchanged from 2.0.0.

@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // ── Version: package.json is the only source (`codedb --version`) ──
+    const release_opts = b.addOptions();
+    release_opts.addOption([]const u8, "semver", packageVersion(b));
+    exe.root_module.addOptions("release_options", release_opts);
+
     // ── nanoregex dependency ──
     const nanoregex_dep = b.dependency("nanoregex", .{});
     exe.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
@@ -92,4 +97,33 @@ pub fn build(b: *std.Build) void {
     });
     state_tests.root_module.addOptions("build_options", state_opts);
     test_step.dependOn(&b.addRunArtifact(state_tests).step);
+
+    // ── End-to-end: `codedb --version` prints package.json's version ──
+    const version_opts = b.addOptions();
+    version_opts.addOptionPath("codedb_exe", exe.getEmittedBin());
+    version_opts.addOptionPath("package_json", b.path("package.json"));
+    const version_tests = b.addTest(.{
+        .name = "version",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/version_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    version_tests.root_module.addOptions("build_options", version_opts);
+    test_step.dependOn(&b.addRunArtifact(version_tests).step);
+}
+
+/// package.json's "version". Embedded, so editing package.json reconfigures
+/// the build; a missing or non-semver version fails it.
+fn packageVersion(b: *std.Build) []const u8 {
+    const pkg = std.json.parseFromSliceLeaky(
+        struct { version: []const u8 },
+        b.allocator,
+        @embedFile("package.json"),
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| std.debug.panic("package.json: cannot read \"version\": {s}", .{@errorName(err)});
+    _ = std.SemanticVersion.parse(pkg.version) catch |err|
+        std.debug.panic("package.json: \"version\" \"{s}\" is not semver: {s}", .{ pkg.version, @errorName(err) });
+    return pkg.version;
 }
