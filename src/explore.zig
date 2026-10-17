@@ -5091,6 +5091,20 @@ pub const Explorer = struct {
         // TS/JS files' top-level code, turned into module nodes after the loop.
         const ModuleBody = struct { path: []const u8, body: []const u8 };
         var modules: std.ArrayList(ModuleBody) = .empty;
+        // Per TS/JS file: receivers whose member calls can't reach repo code.
+        var foreign_by_path = std.StringHashMap([]const []const u8).init(a);
+        var repo_dirs = std.StringHashMap(void).init(a);
+        {
+            var kit = self.outlines.keyIterator();
+            while (kit.next()) |k| {
+                const p = k.*;
+                const s1 = std.mem.indexOfScalar(u8, p, '/') orelse continue;
+                repo_dirs.put(p[0..s1], {}) catch return;
+                if (!std.mem.eql(u8, p[0..s1], "src")) continue;
+                const s2 = std.mem.indexOfScalarPos(u8, p, s1 + 1, '/') orelse continue;
+                repo_dirs.put(p[s1 + 1 .. s2], {}) catch return;
+            }
+        }
 
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
@@ -5125,6 +5139,8 @@ pub const Explorer = struct {
             }
             const lang = entry.value_ptr.language;
             if (lang == .typescript or lang == .javascript) {
+                const foreign = tsForeignReceivers(a, content, &repo_dirs) catch return;
+                foreign_by_path.put(path, foreign) catch return;
                 // The module body is the file with every function and method
                 // span blanked, so it owns only what no named node owns.
                 const body = a.dupe(u8, content) catch return;
@@ -5180,10 +5196,13 @@ pub const Explorer = struct {
             const caller_lang = detectLanguage(caller_path);
             // TS/JS: a method is only reachable through a receiver, so a bare
             // `name(` resolves among the other definitions and `obj.name(` /
-            // `this.name(` among all of them. Other languages keep one pass
-            // over every candidate.
+            // `this.name(` among all of them, except through a receiver that
+            // can't be repo code (`Math.round(`, `fs.closeSync(` with `fs`
+            // imported from "node:fs"). Other languages keep one pass over
+            // every candidate.
             const receiver_aware = caller_lang == .typescript or caller_lang == .javascript;
-            const callees = codegraph.extractCalleeRefs(a, f.body) catch continue;
+            const foreign: []const []const u8 = if (receiver_aware) foreign_by_path.get(caller_path) orelse &.{} else &.{};
+            const callees = codegraph.extractCalleeRefsSkipping(a, f.body, foreign) catch continue;
             for (callees) |callee| {
                 if (isUbiquitousName(callee.name)) continue;
                 const cands = resolve.get(callee.name) orelse continue;
@@ -9243,6 +9262,204 @@ fn tsAssignsFunction(code: []const u8, from: usize) bool {
             continue;
         }
         return tsFunctionValueAt(code, i + 1);
+    }
+    return false;
+}
+
+/// Receivers that are never repo code unless a file binds the name itself.
+const ts_global_receivers = [_][]const u8{ "Math", "JSON", "Object", "Array", "Promise", "Number", "String", "Boolean", "Symbol", "BigInt", "Date", "RegExp", "Reflect", "Proxy", "Intl", "Atomics", "console", "process", "Buffer", "globalThis", "window", "document", "navigator", "performance", "crypto", "URL", "Error" };
+
+/// The receiver names whose member calls in a TS/JS file can't reach repo
+/// code: the well-known globals the file doesn't bind itself, and the
+/// bindings it imports from a package (`import fs from "node:fs"`,
+/// `import * as x from "pkg"`, `import { x } from "pkg"`,
+/// `const x = require("pkg")`). Relative imports are repo code, and so is a
+/// bare specifier whose first segment names a directory in `repo_dirs` (the
+/// repo's top-level directories and those under `src/`, for `baseUrl`
+/// imports). Names are owned by `a`.
+fn tsForeignReceivers(a: std.mem.Allocator, content: []const u8, repo_dirs: *const std.StringHashMap(void)) ![]const []const u8 {
+    var foreign: std.ArrayList([]const u8) = .empty;
+    var local: std.ArrayList([]const u8) = .empty;
+    try tsCollectImports(a, content, repo_dirs, &foreign, &local);
+    for (ts_global_receivers) |g| {
+        if (tsStrIn(foreign.items, g) or tsStrIn(local.items, g) or tsBindsName(content, g)) continue;
+        try foreign.append(a, g);
+    }
+    return foreign.items;
+}
+
+fn tsStrIn(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Whether `spec` names a package: `node:fs`, `fs`, `pkg/sub`, `@scope/pkg`.
+/// Not `./x`, `../x`, `/x`, `~/x`, `#x`, `@/x`, or a repo directory.
+fn tsIsPackageSpecifier(spec: []const u8, repo_dirs: *const std.StringHashMap(void)) bool {
+    if (spec.len == 0) return false;
+    switch (spec[0]) {
+        '.', '/', '~', '#' => return false,
+        else => {},
+    }
+    if (std.mem.startsWith(u8, spec, "node:")) return true;
+    const first = spec[0 .. std.mem.indexOfScalar(u8, spec, '/') orelse spec.len];
+    if (spec[0] == '@' and first.len < 2) return false;
+    return !repo_dirs.contains(first);
+}
+
+/// The string literal starting at `i` (after whitespace), without quotes.
+fn tsQuotedAt(s: []const u8, i: usize) ?[]const u8 {
+    var j = i;
+    while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
+    if (j >= s.len or (s[j] != '"' and s[j] != '\'')) return null;
+    const end = std.mem.indexOfScalarPos(u8, s, j + 1, s[j]) orelse return null;
+    return s[j + 1 .. end];
+}
+
+fn tsIsIdentToken(s: []const u8) bool {
+    if (s.len == 0 or !(tsIsIdentStart(s[0]) or s[0] == '$')) return false;
+    for (s) |c| {
+        if (!(tsIsIdentChar(c) or c == '$')) return false;
+    }
+    return true;
+}
+
+/// Sorts the bindings of every `import ... from "spec"` and
+/// `<const|let|var|import> x = require("spec")` in `content` into `foreign`
+/// (package specifiers) and `local` (repo code).
+fn tsCollectImports(
+    a: std.mem.Allocator,
+    content: []const u8,
+    repo_dirs: *const std.StringHashMap(void),
+    foreign: *std.ArrayList([]const u8),
+    local: *std.ArrayList([]const u8),
+) !void {
+    var i: usize = 0;
+    while (i < content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, i, '\n') orelse content.len;
+        const raw = content[i..line_end];
+        const line = std.mem.trimStart(u8, raw, " \t");
+        if (std.mem.startsWith(u8, line, "import") and line.len > 6 and !tsIsIdentChar(line[6])) {
+            const at = i + (raw.len - line.len) + "import".len;
+            try tsImportStatement(a, content[at..@min(content.len, at + 4096)], repo_dirs, foreign, local);
+        }
+        i = line_end + 1;
+    }
+
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, content, from, "require(")) |p| : (from = p + 1) {
+        if (p > 0 and (tsIsIdentChar(content[p - 1]) or content[p - 1] == '.')) continue;
+        const spec = tsQuotedAt(content, p + "require(".len) orelse continue;
+        const list = if (tsIsPackageSpecifier(spec, repo_dirs)) foreign else local;
+        // Back over `<kw> <binding> =`.
+        var b = p;
+        while (b > 0 and std.ascii.isWhitespace(content[b - 1])) b -= 1;
+        if (b == 0 or content[b - 1] != '=') continue;
+        b -= 1;
+        if (b > 0 and (content[b - 1] == '=' or content[b - 1] == '!' or content[b - 1] == '<' or content[b - 1] == '>')) continue;
+        while (b > 0 and std.ascii.isWhitespace(content[b - 1])) b -= 1;
+        var names: std.ArrayList([]const u8) = .empty;
+        var bind_start = b;
+        if (b > 0 and content[b - 1] == '}') {
+            const open = std.mem.lastIndexOfScalar(u8, content[0..b], '{') orelse continue;
+            var items = std.mem.splitScalar(u8, content[open + 1 .. b - 1], ',');
+            while (items.next()) |item| {
+                var name = std.mem.trim(u8, item, " \t\r\n");
+                if (std.mem.indexOfScalar(u8, name, ':')) |c| name = std.mem.trim(u8, name[c + 1 ..], " \t\r\n");
+                if (tsIsIdentToken(name)) try names.append(a, name);
+            }
+            bind_start = open;
+        } else {
+            while (bind_start > 0 and (tsIsIdentChar(content[bind_start - 1]) or content[bind_start - 1] == '$')) bind_start -= 1;
+            if (bind_start == b) continue;
+            try names.append(a, content[bind_start..b]);
+        }
+        var w = bind_start;
+        while (w > 0 and std.ascii.isWhitespace(content[w - 1])) w -= 1;
+        var ws = w;
+        while (ws > 0 and tsIsIdentChar(content[ws - 1])) ws -= 1;
+        const kw = content[ws..w];
+        if (!(std.mem.eql(u8, kw, "const") or std.mem.eql(u8, kw, "let") or std.mem.eql(u8, kw, "var") or std.mem.eql(u8, kw, "import"))) continue;
+        for (names.items) |n| try list.append(a, try a.dupe(u8, n));
+    }
+}
+
+/// One `import` statement, `s` starting right after the keyword. The clause
+/// before `from` holds only names, commas, `*`, braces and whitespace, so a
+/// side-effect `import "x"`, `import x = require(...)` (left to the require
+/// scan) and `import(...)` bind nothing here.
+fn tsImportStatement(
+    a: std.mem.Allocator,
+    s: []const u8,
+    repo_dirs: *const std.StringHashMap(void),
+    foreign: *std.ArrayList([]const u8),
+    local: *std.ArrayList([]const u8),
+) !void {
+    var j: usize = 0;
+    while (j < s.len and (tsIsIdentChar(s[j]) or s[j] == '$' or s[j] == ',' or s[j] == '*' or s[j] == '{' or s[j] == '}' or std.ascii.isWhitespace(s[j]))) j += 1;
+    if (j >= s.len or (s[j] != '"' and s[j] != '\'')) return;
+    const head = std.mem.trimEnd(u8, s[0..j], " \t\r\n");
+    if (!std.mem.endsWith(u8, head, "from") or head.len == 4) return;
+    if (!std.ascii.isWhitespace(head[head.len - 5]) and head[head.len - 5] != '}') return;
+    const spec = tsQuotedAt(s, j) orelse return;
+    var clause = std.mem.trim(u8, head[0 .. head.len - 4], " \t\r\n");
+    if (std.mem.startsWith(u8, clause, "type") and clause.len > 4 and std.ascii.isWhitespace(clause[4])) clause = std.mem.trimStart(u8, clause[4..], " \t\r\n");
+    const list = if (tsIsPackageSpecifier(spec, repo_dirs)) foreign else local;
+
+    // Default binding: `x` in `import x from`, `import x, { y } from`.
+    const def = std.mem.trim(u8, clause[0 .. std.mem.indexOfAny(u8, clause, ",{*") orelse clause.len], " \t\r\n");
+    if (tsIsIdentToken(def)) try list.append(a, try a.dupe(u8, def));
+    // Namespace: `* as x`.
+    if (std.mem.indexOfScalar(u8, clause, '*')) |star| {
+        const rest = std.mem.trimStart(u8, clause[star + 1 ..], " \t\r\n");
+        if (std.mem.startsWith(u8, rest, "as") and rest.len > 2 and std.ascii.isWhitespace(rest[2])) {
+            const after = std.mem.trimStart(u8, rest[2..], " \t\r\n");
+            var e: usize = 0;
+            while (e < after.len and (tsIsIdentChar(after[e]) or after[e] == '$')) e += 1;
+            if (tsIsIdentToken(after[0..e])) try list.append(a, try a.dupe(u8, after[0..e]));
+        }
+    }
+    // Named: `{ x, y as z, type t }`.
+    if (std.mem.indexOfScalar(u8, clause, '{')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, clause, open, '}') orelse clause.len;
+        var items = std.mem.splitScalar(u8, clause[open + 1 .. close], ',');
+        while (items.next()) |item| {
+            var name = std.mem.trim(u8, item, " \t\r\n");
+            if (std.mem.startsWith(u8, name, "type") and name.len > 4 and std.ascii.isWhitespace(name[4])) name = std.mem.trimStart(u8, name[4..], " \t\r\n");
+            if (std.mem.lastIndexOf(u8, name, " as ")) |x| name = std.mem.trim(u8, name[x + 4 ..], " \t\r\n");
+            if (tsIsIdentToken(name)) try list.append(a, try a.dupe(u8, name));
+        }
+    }
+}
+
+/// Whether `content` may bind `name` itself, read conservatively: after
+/// `const`/`let`/`var`/`function`/`class`/`import`, or in a parameter or
+/// destructuring position (`(name)`, `, name:`, `{ name }`). A use such as
+/// `name.x` doesn't count.
+fn tsBindsName(content: []const u8, name: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, content, from, name)) |p| : (from = p + 1) {
+        if (p > 0 and (tsIsIdentChar(content[p - 1]) or content[p - 1] == '$' or content[p - 1] == '.')) continue;
+        const e = p + name.len;
+        if (e < content.len and (tsIsIdentChar(content[e]) or content[e] == '$')) continue;
+        var b = p;
+        while (b > 0 and std.ascii.isWhitespace(content[b - 1])) b -= 1;
+        var n = e;
+        while (n < content.len and std.ascii.isWhitespace(content[n])) n += 1;
+        const next: u8 = if (n < content.len) content[n] else 0;
+        if (next == '.' or next == '?') continue;
+        var w = b;
+        while (w > 0 and tsIsIdentChar(content[w - 1])) w -= 1;
+        const word = content[w..b];
+        for ([_][]const u8{ "const", "let", "var", "function", "class", "import" }) |kw| {
+            if (std.mem.eql(u8, word, kw)) return true;
+        }
+        const prev: u8 = if (b > 0) content[b - 1] else 0;
+        const after_eq: u8 = if (n + 1 < content.len) content[n + 1] else 0;
+        const ends = next == ')' or next == ',' or next == '}' or next == ':' or (next == '=' and after_eq != '=' and after_eq != '>');
+        if ((prev == '(' or prev == ',' or prev == '{') and ends) return true;
     }
     return false;
 }

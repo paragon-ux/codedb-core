@@ -1213,3 +1213,82 @@ test "ts outline: a function expression is a node only as a binding's or member'
     const files = [_][2][]const u8{ .{ "src/fx.ts", fn_expr_ts }, .{ "src/run.ts", lib_run_ts } };
     try testing.expect(try graphHasEdge(&files, .{ .path = "src/fx.ts", .name = "<module>", .line = 1 }, .{ .path = "src/run.ts", .name = "runSuite", .line = 1 }));
 }
+
+const repo_round_ts =
+    \\export function round(x: number): number {
+    \\  return x;
+    \\}
+    \\export function helper(): number {
+    \\  return 1;
+    \\}
+    \\
+;
+
+/// Imports `fs` from a package, and keeps its own `this.closeSync()`.
+const repo_client_ts =
+    \\import fs from "node:fs";
+    \\export class Client {
+    \\  closeSync(): void {
+    \\    fs.closeSync(1);
+    \\  }
+    \\  stop(): void {
+    \\    this.closeSync();
+    \\  }
+    \\}
+    \\
+;
+
+const foreign_use_ts =
+    \\import fs from "node:fs";
+    \\import * as cp from "child_process";
+    \\import { promises as fsp } from "fs";
+    \\const os = require("node:os");
+    \\export function viaMath(x: number): number {
+    \\  return Math.round(x);
+    \\}
+    \\export function viaImport(fd: number): void {
+    \\  fs.closeSync(fd);
+    \\  fsp.closeSync(fd);
+    \\  cp.closeSync(fd);
+    \\  os.round(fd);
+    \\}
+    \\export function viaBare(x: number): number {
+    \\  return round(x);
+    \\}
+    \\
+;
+
+const relative_use_ts =
+    \\import * as util from "./round";
+    \\export function viaRelative(): number {
+    \\  return util.helper();
+    \\}
+    \\export function shadowed(Math: Calc): number {
+    \\  return Math.round(2);
+    \\}
+    \\
+;
+
+test "ts call graph: a call through a global or a package import reaches no repo code" {
+    const files = [_][2][]const u8{
+        .{ "src/round.ts", repo_round_ts },
+        .{ "src/client.ts", repo_client_ts },
+        .{ "src/use.ts", foreign_use_ts },
+        .{ "src/relative.ts", relative_use_ts },
+    };
+    const round: Node = .{ .path = "src/round.ts", .name = "round", .line = 1 };
+    const close_sync: Node = .{ .path = "src/client.ts", .name = "closeSync", .line = 3 };
+    // A global receiver.
+    try testing.expect(!try graphHasEdge(&files, .{ .path = "src/use.ts", .name = "viaMath", .line = 5 }, round));
+    // Package-import receivers: default, namespace, named and require bindings.
+    const via_import: Node = .{ .path = "src/use.ts", .name = "viaImport", .line = 8 };
+    try testing.expect(!try graphHasEdge(&files, via_import, close_sync));
+    try testing.expect(!try graphHasEdge(&files, via_import, round));
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/use.ts", .name = "viaBare", .line = 14 }, round));
+    // A relative import is repo code.
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/relative.ts", .name = "viaRelative", .line = 2 }, .{ .path = "src/round.ts", .name = "helper", .line = 4 }));
+    // A file's own binding shadows the global.
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/relative.ts", .name = "shadowed", .line = 5 }, round));
+    // `this.x()` in a file that imports a package is unaffected.
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/client.ts", .name = "stop", .line = 6 }, close_sync));
+}

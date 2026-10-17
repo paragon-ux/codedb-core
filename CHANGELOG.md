@@ -21,6 +21,15 @@
   - Assignments to a property, such as `exports.handler = function (` or `Foo.prototype.bar = function (`, and `declare function` signatures have no node. Before, they were named `exports`, `Foo` or `declare`.
   - Generators now have nodes: `async function* gen(` and `function *gen(`.
   - Svelte, Vue and Astro script lines get the whole-word rule but aren't masked.
+- **TS/JS calls through a global or a package import reach no repo code.** Calls resolve by name, so `Math.round(x)` reached the repo's own `round`, and `fs.closeSync(fd)` reached `ResidentCodedbClient.closeSync` even with `fs` imported from `"node:fs"`.
+  - A call through a receiver whose chain starts with one of these identifiers now gets no candidates and no edge:
+    - A well-known global: `Math`, `JSON`, `Object`, `Array`, `Promise`, `Number`, `String`, `Boolean`, `Symbol`, `BigInt`, `Date`, `RegExp`, `Reflect`, `Proxy`, `Intl`, `Atomics`, `console`, `process`, `Buffer`, `globalThis`, `window`, `document`, `navigator`, `performance`, `crypto`, `URL`, `Error`.
+    - A binding imported from a package: `import x from "pkg"`, `import * as x from "node:fs"`, `import { x } from "pkg"`, `const x = require("pkg")`.
+  - Chains count from their first identifier, so `fs.promises.readFile(` is skipped too.
+  - A global is skipped only when the file doesn't bind that name itself. Shadowing is read conservatively: any `const`/`let`/`var`/`function`/`class`/`import` of the name, or the name in a parameter or destructuring position, keeps its candidates.
+  - Relative imports are repo code, and so are `~/`, `#` and `@/` specifiers, and a bare specifier whose first segment is a repo directory (top level or under `src/`, for `baseUrl` imports).
+  - This only narrows resolution: ambiguous names still emit no edge, `this.x()` is unaffected, and other languages are unchanged.
+  - Known limitation: a receiver that is a local variable of unknown type, such as `session.send(...)`, still resolves by name.
 - **A regex inside a template interpolation no longer masks the rest of the file.** In `` `"${value.replace(/["^&|<>]/gu, "^$&")}"` ``, the `"` inside the regex opened a string that swallowed the `}`. The closing backtick then opened a template that never closed, so the TS/JS masker blanked every later line. Interpolations now skip regex literals the way code outside templates does. The masked lines had hidden class members and object-literal functions after such a line. With keywords now read from masked code, they would also have hidden every later `function` declaration.
 - **Tests**:
   - `src/ts_callgraph_test.zig` covers name lookup for a src function with same-named test mocks, two src definitions with a mock, and mocks only.
@@ -28,6 +37,8 @@
   - It also covers the keyword rule, with the false nodes from the Waymark repo and each genuine form: `export default function`, generators, `const f = function () {`, `handler: function (args) {`.
   - It also covers a regex inside a template interpolation, and division inside one.
   - It also covers function expressions passed, returned, assigned to a binding, a class field, an object property or a property path, and a `declare function`.
+  - It also covers calls through a global, through package-import bindings (default, namespace, named, `require`), through a relative import, through a shadowed global, and `this.x()` in a file that imports a package.
+  - `src/codegraph.zig` tests `extractCalleeRefsSkipping` with chains, `?.` and line breaks, and with call, index and `this` receivers.
   - `src/neighbors_json_test.zig` checks the CLI JSON for a resolved name with and without neighbors.
 
 ## 2.1.0

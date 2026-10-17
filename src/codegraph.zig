@@ -92,6 +92,14 @@ pub const CalleeRef = struct {
 
 /// extractCallees, keeping whether each name was called with a receiver.
 pub fn extractCalleeRefs(allocator: std.mem.Allocator, body: []const u8) ![]CalleeRef {
+    return extractCalleeRefsSkipping(allocator, body, &.{});
+}
+
+/// extractCalleeRefs, leaving out every call through a receiver chain whose
+/// first identifier is in `foreign`: with `Math` and `fs` there,
+/// `Math.round(x)` and `fs.promises.readFile(p)` record nothing, since
+/// neither can reach a definition in the repo.
+pub fn extractCalleeRefsSkipping(allocator: std.mem.Allocator, body: []const u8, foreign: []const []const u8) ![]CalleeRef {
     var seen = std.StringHashMap(usize).init(allocator);
     defer seen.deinit();
     var out: std.ArrayList(CalleeRef) = .empty;
@@ -182,15 +190,51 @@ pub fn extractCalleeRefs(allocator: std.mem.Allocator, body: []const u8) ![]Call
         if (!isIdentStart(name[0])) continue; // started on a digit → not an ident
         if (isCallKeyword(name)) continue;
         if (followsDeclKeyword(body, start)) continue; // `function helper(` declares, not calls
+        const member = hasReceiver(body, start);
+        if (member and foreign.len > 0) {
+            if (receiverRoot(body, start)) |root| {
+                if (containsName(foreign, root)) continue;
+            }
+        }
         const g = try seen.getOrPut(name);
         if (!g.found_existing) {
             g.value_ptr.* = out.items.len;
             try out.append(allocator, .{ .name = name });
         }
         const ref = &out.items[g.value_ptr.*];
-        if (hasReceiver(body, start)) ref.member = true else ref.bare = true;
+        if (member) ref.member = true else ref.bare = true;
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// The first identifier of the receiver chain before the call name at
+/// `start`: `fs` in `fs.promises.readFile(` (also across `?.` and line
+/// breaks). Null when the chain starts with anything but an identifier,
+/// such as a call (`a().b(`), an index (`a[0].b(`) or a literal.
+fn receiverRoot(body: []const u8, start: usize) ?[]const u8 {
+    var p = start;
+    if (p > 0 and body[p - 1] == '#') p -= 1;
+    var root: ?[]const u8 = null;
+    while (p > 0 and body[p - 1] == '.') {
+        p -= 1;
+        if (p > 0 and body[p - 1] == '?') p -= 1;
+        while (p > 0 and std.ascii.isWhitespace(body[p - 1])) p -= 1;
+        const e = p;
+        while (p > 0 and isIdentChar(body[p - 1])) p -= 1;
+        if (p == e or !isIdentStart(body[p])) return null;
+        root = body[p..e];
+        var q = p;
+        while (q > 0 and std.ascii.isWhitespace(body[q - 1])) q -= 1;
+        if (q > 0 and body[q - 1] == '.') p = q;
+    }
+    return root;
 }
 
 /// True when the identifier at `start` is called through a receiver: a `.`
@@ -495,3 +539,28 @@ test "extractCalleeRefs records receiver and bare calls" {
     }
 }
 
+
+test "extractCalleeRefsSkipping leaves out calls through a foreign receiver root" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const body =
+        \\Math.round(1); fs.promises.readFile(p); fs
+        \\  .closeSync(1); a?.b.c(); this.x(); x.round(); f().write(); obj[0].y(); Math?.max(1);
+    ;
+    const refs = try extractCalleeRefsSkipping(alloc, body, &.{ "fs", "Math" });
+    defer alloc.free(refs);
+    const want = [_]CalleeRef{
+        .{ .name = "c", .member = true },
+        .{ .name = "x", .member = true },
+        .{ .name = "round", .member = true },
+        .{ .name = "f", .bare = true },
+        .{ .name = "write", .member = true },
+        .{ .name = "y", .member = true },
+    };
+    try testing.expectEqual(want.len, refs.len);
+    for (want, refs) |w, r| {
+        try testing.expectEqualStrings(w.name, r.name);
+        try testing.expectEqual(w.bare, r.bare);
+        try testing.expectEqual(w.member, r.member);
+    }
+}
