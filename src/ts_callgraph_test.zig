@@ -1141,3 +1141,75 @@ test "ts outline: a regex in a template interpolation does not mask the rest of 
         .{ .name = "last", .kind = .function, .start = 7, .end = 9 },
     });
 }
+
+const fn_expr_ts =
+    \\describe("suite", function () {
+    \\  runSuite();
+    \\});
+    \\export function wrap(xs: number[]) {
+    \\  return xs.map(function (x) {
+    \\    return x;
+    \\  });
+    \\}
+    \\const later = wrap(function () {
+    \\  return 1;
+    \\});
+    \\const named = async function () {
+    \\  return 2;
+    \\};
+    \\exports.handler = function (event) {
+    \\  return event;
+    \\};
+    \\export class Svc {
+    \\  onExit = function () {
+    \\    stop();
+    \\  };
+    \\}
+    \\const obj = {
+    \\  handler: async function (args) {
+    \\    return args;
+    \\  },
+    \\};
+    \\let plain = function* () {
+    \\  yield 1;
+    \\};
+    \\for (const x of xs) {
+    \\  use(x);
+    \\}
+    \\declare function ambient(a: number): void;
+    \\
+;
+
+test "ts outline: a function expression is a node only as a binding's or member's value" {
+    // Passed (`describe(..., function () {`) or returned, it once became a
+    // function named after the line's first word, whose span swallowed the
+    // declarations after it.
+    try expectCallables("src/fx.ts", fn_expr_ts, &.{
+        .{ .name = "wrap", .kind = .function, .start = 4, .end = 8 },
+        .{ .name = "named", .kind = .function, .start = 12, .end = 14 },
+        .{ .name = "onExit", .kind = .method, .start = 19, .end = 21 },
+        .{ .name = "handler", .kind = .method, .start = 24, .end = 26 },
+        .{ .name = "plain", .kind = .function, .start = 28, .end = 30 },
+    });
+    try expectKind("src/fx.ts", fn_expr_ts, "later", 9, .constant);
+
+    var parsed = try Explorer.parseContentForIndexing(testing.allocator, "src/fx.ts", fn_expr_ts);
+    defer parsed.deinit();
+    const not_symbols = [_][]const u8{ "describe", "return", "exports", "for", "declare" };
+    for (parsed.outline.symbols.items) |s| {
+        for (not_symbols) |n| {
+            errdefer std.debug.print("unexpected symbol {s} on line {d}\n", .{ s.name, s.line_start });
+            try testing.expect(!std.mem.eql(u8, s.name, n));
+        }
+    }
+
+    // The callback's call belongs to the module node now.
+    const lib_run_ts =
+        \\export function runSuite(): void {
+        \\  return;
+        \\}
+        \\
+    ;
+    const files = [_][2][]const u8{ .{ "src/fx.ts", fn_expr_ts }, .{ "src/run.ts", lib_run_ts } };
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/fx.ts", .name = "<module>", .line = 1 }, .{ .path = "src/run.ts", .name = "runSuite", .line = 1 }));
+}

@@ -6642,16 +6642,9 @@ pub const Explorer = struct {
         // keyword sniff below matches keywords anywhere on the line, so it
         // would record `parse(type: string) {` as a type_alias "parse".
         const fed: TsParseState.Fed = if (ts) |st| try st.feedLine(a, outline, line, line_num) else .{ .claimed = false, .code = line };
-        // Keywords count only in code (`fed.code` has strings, templates and
-        // comments blanked) and as whole words, so neither
-        // `assert.ok(x, "no function here")` nor `functionName:` declares a
-        // function. Component files have no TsParseState and are not masked.
-        if (!fed.claimed and tsHasDeclKeyword(fed.code)) {
-            const kind = tsKeywordKind(fed.code);
-            const trimmed = skipKeywords(line);
-            if (extractIdent(trimmed)) |name| {
-                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
-            }
+        // Component files have no TsParseState, so their lines are not masked.
+        if (!fed.claimed) {
+            if (tsKeywordDecl(line, fed.code)) |d| try appendOutlineSymbol(a, outline, d.name, d.kind, line_num, line);
         }
         if (startsWith(line, "import ") or containsAny(line, &.{"require("})) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
@@ -9192,6 +9185,78 @@ fn tsHasDeclKeyword(code: []const u8) bool {
         if (tsHasKeyword(code, kw)) return true;
     }
     return false;
+}
+
+const TsKeywordDecl = struct { name: []const u8, kind: SymbolKind };
+
+/// parseTsLine's keyword sniff, on `line` and `code` (the line with strings,
+/// templates and comments blanked). A declaration keyword counts only where
+/// it starts the line, after `export`/`default`/`async`/`abstract`:
+/// `function f(`, `class C`, `type T`, `const x =`. A function expression
+/// counts only as a binding's or member's value: `const f = function (`,
+/// `onExit = function (`, `handler: function (`. So
+/// `describe("x", function () {` and `return xs.map(function (x) {` declare
+/// nothing, nor do keywords inside strings or comments.
+fn tsKeywordDecl(line: []const u8, code: []const u8) ?TsKeywordDecl {
+    const rest = skipKeywords(line);
+    const start = @min(line.len - rest.len, code.len);
+    const prefix = code[0..start];
+    if (tsHasDeclKeyword(prefix)) {
+        const name = extractIdent(rest) orelse return null;
+        const kind: SymbolKind = if (tsHasKeyword(prefix, "function"))
+            .function
+        else if (tsHasKeyword(prefix, "class"))
+            .class_def
+        else if (tsHasKeyword(prefix, "interface"))
+            .interface_def
+        else if (tsHasKeyword(prefix, "enum"))
+            .enum_def
+        else if (tsHasKeyword(prefix, "type"))
+            .type_alias
+        else if (tsAssignsFunction(code, start + name.len))
+            .function
+        else switch (tsKeywordKind(code)) {
+            // `const x = wrap(function () {`: a function argument, not the value.
+            .function => .constant,
+            else => |k| k,
+        };
+        return .{ .name = name, .kind = kind };
+    }
+    const name = extractIdent(code) orelse return null;
+    const i = tsSkipWs(code, name.len);
+    if (i >= code.len) return null;
+    const next: u8 = if (i + 1 < code.len) code[i + 1] else 0;
+    const assigns = code[i] == ':' or (code[i] == '=' and next != '=' and next != '>');
+    if (!assigns or !tsFunctionValueAt(code, i + 1)) return null;
+    return .{ .name = line[0..name.len], .kind = .function };
+}
+
+/// Whether the binding whose name ends at `from` is assigned a function
+/// expression: `= function (`, `= async function (`, past a type annotation.
+fn tsAssignsFunction(code: []const u8, from: usize) bool {
+    var i = from;
+    while (i < code.len) : (i += 1) {
+        if (code[i] != '=') continue;
+        const next: u8 = if (i + 1 < code.len) code[i + 1] else 0;
+        if (next == '>' or next == '=') {
+            i += 1; // `=>` in a function type, `==`
+            continue;
+        }
+        return tsFunctionValueAt(code, i + 1);
+    }
+    return false;
+}
+
+/// Whether a function expression (`function`, `async function`, generators
+/// included) starts at `start`, past whitespace.
+fn tsFunctionValueAt(code: []const u8, start: usize) bool {
+    var i = tsSkipWs(code, start);
+    if (std.mem.startsWith(u8, code[i..], "async") and i + 5 < code.len and (code[i + 5] == ' ' or code[i + 5] == '\t')) {
+        i = tsSkipWs(code, i + 5);
+    }
+    if (!std.mem.startsWith(u8, code[i..], "function")) return false;
+    const j = i + "function".len;
+    return j < code.len and (code[j] == ' ' or code[j] == '\t' or code[j] == '(' or code[j] == '*');
 }
 
 /// A call-graph body starts at its declaration line, so the name in

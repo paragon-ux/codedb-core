@@ -15,6 +15,10 @@
 - **TS/JS keywords count only as whole words in code.** The outline's keyword sniff matched `function`, `class`, `const` and the other declaration keywords anywhere on a line, inside strings, template literals and comments too. It then named a symbol after the line's first identifier. For example, `assert.deepEqual(x, ["function launch"])` became a function `assert` whose span absorbed the calls after it. `const traceRes = q({ functionName: "x" })` and `const t = \`function x() {\`` became functions instead of constants, and `helper.class = 1` became a class.
   - A keyword now counts only outside strings, templates and comments, and only as a whole word that isn't a property (`x.class`).
   - It must be followed by whitespace. `function` may also be followed by `(` or `*`, so `type:` keys don't count.
+  - A declaration keyword counts only where it starts the line, after `export`, `default`, `async` or `abstract`.
+  - A function expression is a node only as a binding's or member's value: `const f = function (`, `onExit = function (`, `handler: function (`. Before, a function passed or returned, as in `describe("x", function () {` or `return xs.map(function (x) {`, became a function named `describe` or `return`. Its span swallowed the declarations after it.
+  - A function passed as a binding's value, as in `const x = wrap(function () {`, makes `x` a constant. Its calls now belong to the enclosing node.
+  - Assignments to a property, such as `exports.handler = function (` or `Foo.prototype.bar = function (`, and `declare function` signatures have no node. Before, they were named `exports`, `Foo` or `declare`.
   - Generators now have nodes: `async function* gen(` and `function *gen(`.
   - Svelte, Vue and Astro script lines get the whole-word rule but aren't masked.
 - **A regex inside a template interpolation no longer masks the rest of the file.** In `` `"${value.replace(/["^&|<>]/gu, "^$&")}"` ``, the `"` inside the regex opened a string that swallowed the `}`. The closing backtick then opened a template that never closed, so the TS/JS masker blanked every later line. Interpolations now skip regex literals the way code outside templates does. The masked lines had hidden class members and object-literal functions after such a line. With keywords now read from masked code, they would also have hidden every later `function` declaration.
@@ -23,6 +27,7 @@
   - It also covers a test file's calls to its own helpers, with two same-file definitions and with a src caller.
   - It also covers the keyword rule, with the false nodes from the Waymark repo and each genuine form: `export default function`, generators, `const f = function () {`, `handler: function (args) {`.
   - It also covers a regex inside a template interpolation, and division inside one.
+  - It also covers function expressions passed, returned, assigned to a binding, a class field, an object property or a property path, and a `declare function`.
   - `src/neighbors_json_test.zig` checks the CLI JSON for a resolved name with and without neighbors.
 
 ## 2.1.0
