@@ -1,6 +1,6 @@
 //! End-to-end check of the call-graph JSON: every node `callers`, `callees`
-//! and `neighbors` emit carries `kind` and `qualified`, and a qualified name
-//! is accepted as the query.
+//! and `neighbors` emit carries `kind` and `qualified`, a qualified name is
+//! accepted as the query, and an ambiguous one lists its candidates.
 const std = @import("std");
 const build_options = @import("build_options");
 const testing = std.testing;
@@ -16,6 +16,18 @@ const svc_ts =
     \\  return 1;
     \\}
     \\target();
+    \\
+;
+
+const shapes_ts =
+    \\export class Shapes {
+    \\  get size(): number {
+    \\    return 1;
+    \\  }
+    \\  set size(n: number) {
+    \\    return;
+    \\  }
+    \\}
     \\
 ;
 
@@ -53,6 +65,7 @@ test "call-graph JSON: nodes carry kind and qualified, and qualified names resol
     const arena = arena_state.allocator();
     try tmp.dir.createDirPath(io, "proj/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "proj/src/svc.ts", .data = svc_ts });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/src/shapes.ts", .data = shapes_ts });
     const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.codedb_exe, arena);
     const proj = try tmp.dir.realPathFileAlloc(io, "proj", arena);
 
@@ -71,4 +84,25 @@ test "call-graph JSON: nodes carry kind and qualified, and qualified names resol
     const bare = try runJson(arena, exe, proj, &.{ "neighbors", "start" });
     try expectContains(bare, "\"ambiguous\":false");
     try expectContains(bare, "\"name\":\"target\"");
+
+    // An ambiguous qualified name lists its candidates, as a bare name does.
+    const getter = "{\"path\":\"src/shapes.ts\",\"name\":\"size\",\"line\":2,\"kind\":\"method\",\"qualified\":\"Shapes.size\"}";
+    const setter = "{\"path\":\"src/shapes.ts\",\"name\":\"size\",\"line\":5,\"kind\":\"method\",\"qualified\":\"Shapes.size\"}";
+    const amb = try runJson(arena, exe, proj, &.{ "neighbors", "Shapes.size" });
+    try expectContains(amb, "\"symbol_exists\":true,\"ambiguous\":true,\"count\":2,\"results\":[");
+    try expectContains(amb, getter);
+    try expectContains(amb, setter);
+    const amb_callers = try runJson(arena, exe, proj, &.{ "callers", "Shapes.size" });
+    try expectContains(amb_callers, "\"ambiguous\":true,\"count\":2,\"results\":[");
+    try expectContains(amb_callers, getter);
+    try expectContains(amb_callers, setter);
+
+    const missing = try runJson(arena, exe, proj, &.{ "neighbors", "Shapes.area" });
+    try expectContains(missing, "\"symbol_exists\":false,\"ambiguous\":false");
+
+    // `symbol` results carry the qualified name as well.
+    const sym = try runJson(arena, exe, proj, &.{ "symbol", "start" });
+    try expectContains(sym, "{\"path\":\"src/svc.ts\",\"line\":2,\"kind\":\"method\",\"name\":\"start\",\"qualified\":\"Svc.start\"");
+    const sym_fn = try runJson(arena, exe, proj, &.{ "symbol", "target" });
+    try expectContains(sym_fn, "\"name\":\"target\",\"qualified\":\"target\"");
 }

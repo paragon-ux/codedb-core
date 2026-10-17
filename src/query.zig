@@ -278,6 +278,8 @@ fn runSymbol(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Style,
             appendJsonStr(a, &buf, @tagName(r.symbol.kind));
             buf.appendSlice(a, ",\"name\":") catch {};
             appendJsonStr(a, &buf, r.symbol.name);
+            buf.appendSlice(a, ",\"qualified\":") catch {};
+            appendJsonStr(a, &buf, symbolLabel(r.symbol));
             if (r.symbol.detail) |d| {
                 buf.appendSlice(a, ",\"detail\":") catch {};
                 appendJsonStr(a, &buf, d);
@@ -328,6 +330,11 @@ fn appendStepJson(a: std.mem.Allocator, buf: *std.ArrayList(u8), st: explore_mod
     buf.appendSlice(a, ",\"qualified\":") catch {};
     appendJsonStr(a, buf, stepLabel(st));
     buf.append(a, '}') catch {};
+}
+
+/// A candidate definition's qualified name, or its bare name when it has none.
+fn symbolLabel(sym: explore_mod.Symbol) []const u8 {
+    return sym.qualified orelse sym.name;
 }
 
 fn stepLabel(st: explore_mod.CallPathStep) []const u8 {
@@ -388,15 +395,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
 
     // No resolved neighbors: distinguish an ambiguous name from a genuine miss
     // and surface the file-scoped candidate definitions (fail-closed, no merge).
-    const spec = explore_mod.Explorer.SymbolSearchSpec{
-        .name = name,
-        .prefix = null,
-        .pattern = null,
-        .kind = null,
-        .fuzzy = false,
-        .max_results = 200,
-    };
-    const cands = explorer.searchSymbols(spec, a) catch return 1;
+    const cands = explorer.neighborCandidates(name, a) catch return 1;
     var callable_count: usize = 0;
     for (cands) |r| {
         if (r.symbol.kind == .function or r.symbol.kind == .method) callable_count += 1;
@@ -429,6 +428,8 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
                 jsonInt(a, &buf, r.symbol.line_start);
                 buf.appendSlice(a, ",\"kind\":") catch {};
                 appendJsonStr(a, &buf, @tagName(r.symbol.kind));
+                buf.appendSlice(a, ",\"qualified\":") catch {};
+                appendJsonStr(a, &buf, symbolLabel(r.symbol));
                 buf.append(a, '}') catch {};
             }
             buf.appendSlice(a, "]}\n") catch {};
@@ -450,7 +451,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
         for (cands) |r| {
             if (r.symbol.kind != .function and r.symbol.kind != .method) continue;
             out.p("  {s}{s}{s}:{s}{d}{s}  {s}{s}{s} {s}{s}{s}\n", .{
-                s.cyan, r.path, s.reset, s.dim, r.symbol.line_start, s.reset, s.bold, r.symbol.name, s.reset, s.dim, @tagName(r.symbol.kind), s.reset,
+                s.cyan, r.path, s.reset, s.dim, r.symbol.line_start, s.reset, s.bold, symbolLabel(r.symbol), s.reset, s.dim, @tagName(r.symbol.kind), s.reset,
             });
         }
         return 0;
@@ -528,6 +529,8 @@ fn runCombinedNeighbors(
                 jsonInt(a, &buf, r.symbol.line_start);
                 buf.appendSlice(a, ",\"kind\":") catch {};
                 appendJsonStr(a, &buf, @tagName(r.symbol.kind));
+                buf.appendSlice(a, ",\"qualified\":") catch {};
+                appendJsonStr(a, &buf, symbolLabel(r.symbol));
                 buf.append(a, '}') catch {};
             }
             buf.appendSlice(a, "]}\n") catch {};
@@ -575,8 +578,8 @@ fn runCombinedNeighbors(
         });
         for (res.candidates) |r| {
             const kind = @tagName(r.symbol.kind);
-            out.p("  {s}{s}{s}  {s}{s}{s}:{s}{d}{s}\n", .{
-                s.kindColor(kind), kind, s.reset, s.dim, r.path, s.reset, s.cyan, r.symbol.line_start, s.reset,
+            out.p("  {s}{s}{s}  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
+                s.kindColor(kind), kind, s.reset, s.dim, r.path, s.reset, s.cyan, r.symbol.line_start, s.reset, s.bold, symbolLabel(r.symbol), s.reset,
             });
         }
         return 0;

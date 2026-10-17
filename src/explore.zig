@@ -3162,6 +3162,36 @@ pub const Explorer = struct {
         return null;
     }
 
+    /// Frees one result of searchSymbols or neighborCandidates.
+    pub fn freeScoredSymbol(alloc: std.mem.Allocator, r: ScoredSymbolResult) void {
+        alloc.free(r.path);
+        alloc.free(r.symbol.name);
+        if (r.symbol.detail) |d| alloc.free(d);
+        if (r.symbol.qualified) |q| alloc.free(q);
+    }
+
+    fn cloneScoredSymbol(alloc: std.mem.Allocator, path: []const u8, sym: Symbol, score: f32) !ScoredSymbolResult {
+        const path_copy = try alloc.dupe(u8, path);
+        errdefer alloc.free(path_copy);
+        const name_copy = try alloc.dupe(u8, sym.name);
+        errdefer alloc.free(name_copy);
+        const detail_copy: ?[]u8 = if (sym.detail) |d| try alloc.dupe(u8, d) else null;
+        errdefer if (detail_copy) |d| alloc.free(d);
+        const qualified_copy: ?[]u8 = if (sym.qualified) |q| try alloc.dupe(u8, q) else null;
+        return .{
+            .path = path_copy,
+            .symbol = .{
+                .name = name_copy,
+                .kind = sym.kind,
+                .line_start = sym.line_start,
+                .line_end = sym.line_end,
+                .detail = detail_copy,
+                .qualified = qualified_copy,
+            },
+            .score = score,
+        };
+    }
+
     pub fn searchSymbols(self: *Explorer, spec: SymbolSearchSpec, allocator: std.mem.Allocator) ![]ScoredSymbolResult {
         self.ensureSymbolIndex();
         self.mu.lockShared();
@@ -3205,36 +3235,11 @@ pub const Explorer = struct {
             }
         };
 
-        const freeOne = struct {
-            fn call(alloc: std.mem.Allocator, r: ScoredSymbolResult) void {
-                alloc.free(r.path);
-                alloc.free(r.symbol.name);
-                if (r.symbol.detail) |d| alloc.free(d);
-            }
-        }.call;
+        const freeOne = freeScoredSymbol;
 
         const cloneOne = struct {
             fn call(alloc: std.mem.Allocator, candidate: Candidate) !ScoredSymbolResult {
-                const path_copy = try alloc.dupe(u8, candidate.path);
-                errdefer alloc.free(path_copy);
-                const name_copy = try alloc.dupe(u8, candidate.symbol.name);
-                errdefer alloc.free(name_copy);
-                var detail_copy: ?[]u8 = null;
-                errdefer if (detail_copy) |d| alloc.free(d);
-                if (candidate.symbol.detail) |d| {
-                    detail_copy = try alloc.dupe(u8, d);
-                }
-                return .{
-                    .path = path_copy,
-                    .symbol = .{
-                        .name = name_copy,
-                        .kind = candidate.symbol.kind,
-                        .line_start = candidate.symbol.line_start,
-                        .line_end = candidate.symbol.line_end,
-                        .detail = detail_copy,
-                    },
-                    .score = candidate.score,
-                };
+                return cloneScoredSymbol(alloc, candidate.path, candidate.symbol, candidate.score);
             }
         }.call;
 
@@ -3312,10 +3317,12 @@ pub const Explorer = struct {
                         for (fc.locs) |loc| {
                             if (spec.kind) |k| if (loc.kind != k) continue;
                             var detail: ?[]const u8 = null;
+                            var qualified: ?[]const u8 = null;
                             if (self.outlines.getPtr(loc.path)) |outline| {
                                 for (outline.symbols.items) |sym| {
                                     if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, fc.name)) {
                                         detail = sym.detail;
+                                        qualified = sym.qualified;
                                         break;
                                     }
                                 }
@@ -3326,6 +3333,7 @@ pub const Explorer = struct {
                                 .line_start = loc.line_start,
                                 .line_end = loc.line_end,
                                 .detail = detail,
+                                .qualified = qualified,
                             }, score);
                         }
                     }
@@ -3339,10 +3347,12 @@ pub const Explorer = struct {
                 for (entry.value_ptr.items) |loc| {
                     if (spec.kind) |k| if (loc.kind != k) continue;
                     var detail: ?[]const u8 = null;
+                    var qualified: ?[]const u8 = null;
                     if (self.outlines.getPtr(loc.path)) |outline| {
                         for (outline.symbols.items) |sym| {
                             if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, sym_name)) {
                                 detail = sym.detail;
+                                qualified = sym.qualified;
                                 break;
                             }
                         }
@@ -3353,6 +3363,7 @@ pub const Explorer = struct {
                         .line_start = loc.line_start,
                         .line_end = loc.line_end,
                         .detail = detail,
+                        .qualified = qualified,
                     }, score);
                 }
             }
@@ -5504,6 +5515,52 @@ pub const Explorer = struct {
         };
     }
 
+    /// The definitions a callers/callees/neighbors name refers to, for the
+    /// ambiguity response and to tell a missing name from one with no edges.
+    /// A bare name is an exact symbol search. A dotted name matches the
+    /// function and method definitions whose qualified name is `name` (the
+    /// same rule as `CallGraph.nodeMatches`), sorted by path and line.
+    /// Free each result with freeScoredSymbol.
+    pub fn neighborCandidates(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) ![]ScoredSymbolResult {
+        if (std.mem.indexOfScalar(u8, name, '.') == null) {
+            return self.searchSymbols(.{
+                .name = name,
+                .prefix = null,
+                .pattern = null,
+                .kind = null,
+                .fuzzy = false,
+                .max_results = 200,
+            }, allocator);
+        }
+        self.ensureSymbolIndex();
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        var list: std.ArrayList(ScoredSymbolResult) = .empty;
+        errdefer {
+            for (list.items) |r| freeScoredSymbol(allocator, r);
+            list.deinit(allocator);
+        }
+        var it = self.outlines.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (sym.kind != .function and sym.kind != .method) continue;
+                if (!std.mem.eql(u8, sym.qualified orelse sym.name, name)) continue;
+                const r = try cloneScoredSymbol(allocator, entry.key_ptr.*, sym, 1.0);
+                errdefer freeScoredSymbol(allocator, r);
+                try list.append(allocator, r);
+            }
+        }
+        std.mem.sort(ScoredSymbolResult, list.items, {}, struct {
+            fn lessThan(_: void, a: ScoredSymbolResult, b: ScoredSymbolResult) bool {
+                const path_cmp = std.mem.order(u8, a.path, b.path);
+                if (path_cmp != .eq) return path_cmp == .lt;
+                return a.symbol.line_start < b.symbol.line_start;
+            }
+        }.lessThan);
+        return list.toOwnedSlice(allocator);
+    }
+
     pub fn bothNeighborsOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) !NeighborResult {
         if (max == 0) return .{
             .callers = &.{},
@@ -5565,16 +5622,8 @@ pub const Explorer = struct {
         self.mu.unlockShared();
 
         // matches != 1: either ambiguous or missing from the call graph.
-        // Query searchSymbols to distinguish candidate definitions from complete miss.
-        const spec = SymbolSearchSpec{
-            .name = name,
-            .prefix = null,
-            .pattern = null,
-            .kind = null,
-            .fuzzy = false,
-            .max_results = 200,
-        };
-        const cands = try self.searchSymbols(spec, allocator);
+        // Look the definitions up to tell candidates from a complete miss.
+        const cands = try self.neighborCandidates(name, allocator);
         var callable_count: usize = 0;
         for (cands) |r| {
             if (r.symbol.kind == .function or r.symbol.kind == .method) callable_count += 1;

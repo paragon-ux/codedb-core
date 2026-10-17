@@ -14,7 +14,11 @@
   - `qualified` is the owner-qualified name of a TS/JS member, and equals `name` otherwise. A class member is `Class.member`. An object-literal member is `binding.member`, where the binding is the `const`/`let`/`var` the object is assigned to, or `default` for `export default {`. Nested objects and class-field objects join with dots (`tools.nested.inner`, `Svc.handlers.onData`).
   - An object without a binding, such as one passed as an argument, keeps bare names.
   - `name` is unchanged and stays the bare name. In the library, `Symbol.qualified` holds the qualified name, and `CallPathStep` gains `kind` plus `qualified`, which callers of `callersOf`/`calleesOf`/`bothNeighborsOf` free along with `path` and `name`.
+  - The candidates of an ambiguity response and `symbol --json` results carry `qualified` too. `searchSymbols` results now own a copy of `symbol.qualified`; free a result with `Explorer.freeScoredSymbol`.
 - **`callers`, `callees`, and `neighbors` accept a qualified name.** A dotted name such as `WaymarkDaemon.start` matches a node's qualified name exactly. A bare name resolves as before, including the ambiguity response, so `start` is still ambiguous when two classes define it. Edge resolution is unchanged: calls are matched by their bare callee name.
+  - A qualified name that matches more than one definition, such as a getter and setter both named `Shapes.size`, gets the same ambiguity response as a bare name: `"ambiguous": true` with every candidate's path, line, kind and qualified name. It still emits no edge.
+  - A qualified name that matches nothing reports `"symbol_exists": false`, so a caller can retry with the bare name.
+  - `Explorer.neighborCandidates` returns the definitions a bare or qualified name refers to.
 - **TS/JS module nodes for top-level code.** Each TS/JS file gets a node named `<module>` (kind `module`, line 1). Its body is the file with every function and method span blanked, so it owns calls in top-level statements and in anonymous top-level callbacks (`test("…", async () => {…})`, `process.once("exit", () => …)`) without duplicating calls that a named node owns.
   - Module nodes only call: nothing resolves to them.
   - They use the same resolution tiers as other nodes, including the bare-call rule.
@@ -25,7 +29,7 @@
 - Lines like `parse(type: string) {` are no longer recorded as a `type_alias` named after the method.
 - **Tests**: `zig build test` now also runs:
   - `src/ts_callgraph_test.zig`: each shape above, the call graph across two files, bare and receiver calls, qualified names and lookup, module nodes, and negative cases.
-  - `src/neighbors_json_test.zig`: runs the built CLI and checks the `kind`/`qualified` JSON and qualified queries.
+  - `src/neighbors_json_test.zig`: runs the built CLI and checks the `kind`/`qualified` JSON, qualified queries, and the ambiguity response for a qualified name.
   - The `codegraph.zig` unit tests, which were never part of the test build before.
 
 ## 2.0.2

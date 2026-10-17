@@ -185,6 +185,76 @@ test "ts call graph: a qualified name resolves where the bare name is ambiguous"
     _ = &both;
 }
 
+fn freeCandidates(cands: []const Explorer.ScoredSymbolResult) void {
+    for (cands) |r| Explorer.freeScoredSymbol(testing.allocator, r);
+    testing.allocator.free(cands);
+}
+
+test "ts call graph: an ambiguous qualified name lists every candidate and emits no edge" {
+    const src =
+        \\export class Shapes {
+        \\  get size(): number {
+        \\    return count();
+        \\  }
+        \\  set size(n: number) {
+        \\    store(n);
+        \\  }
+        \\}
+        \\export function count(): number {
+        \\  return 1;
+        \\}
+        \\export function store(n: number): void {
+        \\  return;
+        \\}
+        \\export function measure(s: Shapes): number {
+        \\  return s.size();
+        \\}
+        \\
+    ;
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    try ex.indexFile("src/shapes.ts", src);
+
+    // The getter and setter are both `Shapes.size`: the same ambiguity
+    // response a bare name gets, with both candidates.
+    const both = try ex.bothNeighborsOf("Shapes.size", testing.allocator, 50);
+    defer freeCandidates(both.candidates);
+    try testing.expect(both.symbol_exists and both.ambiguous);
+    try testing.expectEqual(@as(usize, 0), both.callers.len);
+    try testing.expectEqual(@as(usize, 0), both.callees.len);
+    try testing.expectEqual(@as(usize, 2), both.candidates.len);
+    for (both.candidates, [_]u32{ 2, 5 }) |r, line| {
+        try testing.expectEqualStrings("src/shapes.ts", r.path);
+        try testing.expectEqualStrings("size", r.symbol.name);
+        try testing.expectEqualStrings("Shapes.size", r.symbol.qualified.?);
+        try testing.expectEqual(SymbolKind.method, r.symbol.kind);
+        try testing.expectEqual(line, r.symbol.line_start);
+    }
+
+    // callers/callees fail closed, and nothing resolves to either accessor.
+    const callers = try ex.callersOf("Shapes.size", testing.allocator, 50);
+    defer freeSteps(callers);
+    try testing.expectEqual(@as(usize, 0), callers.len);
+    const callees = try ex.calleesOf("Shapes.size", testing.allocator, 50);
+    defer freeSteps(callees);
+    try testing.expectEqual(@as(usize, 0), callees.len);
+    const cg = ex.call_graph.?;
+    for (cg.edges) |e| try testing.expect(!std.mem.eql(u8, cg.node_qualified[e.to], "Shapes.size"));
+
+    // The bare name's candidates carry their qualified names too.
+    const bare = try ex.bothNeighborsOf("size", testing.allocator, 50);
+    defer freeCandidates(bare.candidates);
+    try testing.expect(bare.ambiguous);
+    try testing.expectEqual(@as(usize, 2), bare.candidates.len);
+    for (bare.candidates) |r| try testing.expectEqualStrings("Shapes.size", r.symbol.qualified.?);
+
+    // A qualified name that names nothing is a miss, not an ambiguity.
+    const missing = try ex.bothNeighborsOf("Shapes.area", testing.allocator, 50);
+    defer freeCandidates(missing.candidates);
+    try testing.expect(!missing.symbol_exists and !missing.ambiguous);
+    try testing.expectEqual(@as(usize, 0), missing.candidates.len);
+}
+
 test "ts outline: qualified names for class and object-literal members" {
     const src =
         \\export class Svc {
