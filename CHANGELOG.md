@@ -1,6 +1,6 @@
 # @paragon-ux/codedb-core
 
-## [Unreleased]
+## 2.1.1
 
 - **A name prefers its one definition outside test files.** Since 2.1.0, object-literal functions are call-graph nodes, so test mocks such as `queryCapnMemory: async () => {…}` passed to the code under test share the real function's name. `callers`, `callees`, and `neighbors` then reported `queryCapnMemory` as ambiguous, with the real function and nine mocks as candidates.
   - A bare or qualified name that matches several definitions now resolves to the one outside test files. A file counts as a test file under the same rule edge resolution uses. Edge resolution already never resolves a call to a test-file definition.
