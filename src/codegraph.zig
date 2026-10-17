@@ -74,9 +74,27 @@ inline fn isIdentChar(c: u8) bool {
 /// the candidate callee (`obj.foo(` yields `foo`; `a[i](` yields nothing). Items
 /// are slices into `body`; caller frees the returned array.
 pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const u8 {
-    var seen = std.StringHashMap(void).init(allocator);
+    const refs = try extractCalleeRefs(allocator, body);
+    defer allocator.free(refs);
+    const names = try allocator.alloc([]const u8, refs.len);
+    for (refs, names) |r, *n| n.* = r.name;
+    return names;
+}
+
+/// A callee name and how the body calls it: `member` through a receiver
+/// (`obj.name(`, `this.name(`, `super.name(`, `this.#name(`, `a?.name(`),
+/// `bare` without one (`name(`). A name called both ways has both set.
+pub const CalleeRef = struct {
+    name: []const u8,
+    bare: bool = false,
+    member: bool = false,
+};
+
+/// extractCallees, keeping whether each name was called with a receiver.
+pub fn extractCalleeRefs(allocator: std.mem.Allocator, body: []const u8) ![]CalleeRef {
+    var seen = std.StringHashMap(usize).init(allocator);
     defer seen.deinit();
-    var out: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(CalleeRef) = .empty;
     errdefer out.deinit(allocator);
 
     const TemplateFrame = struct {
@@ -165,9 +183,22 @@ pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const
         if (isCallKeyword(name)) continue;
         if (followsDeclKeyword(body, start)) continue; // `function helper(` declares, not calls
         const g = try seen.getOrPut(name);
-        if (!g.found_existing) try out.append(allocator, name);
+        if (!g.found_existing) {
+            g.value_ptr.* = out.items.len;
+            try out.append(allocator, .{ .name = name });
+        }
+        const ref = &out.items[g.value_ptr.*];
+        if (hasReceiver(body, start)) ref.member = true else ref.bare = true;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// True when the identifier at `start` is called through a receiver: a `.`
+/// right before it (or before a `#` private name).
+fn hasReceiver(body: []const u8, start: usize) bool {
+    var p = start;
+    if (p > 0 and body[p - 1] == '#') p -= 1;
+    return p > 0 and body[p - 1] == '.';
 }
 
 /// Build resolved call edges for a set of functions. `resolve` maps a callee name
@@ -440,6 +471,27 @@ test "extractCallees template literal and comments" {
         const callees = try extractCallees(alloc, body);
         defer alloc.free(callees);
         try testing.expectEqual(@as(usize, 0), callees.len);
+    }
+}
+
+test "extractCalleeRefs records receiver and bare calls" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const body = "start(); this.start(); a?.stop(); this.#hidden(); super.init(x); run()";
+    const refs = try extractCalleeRefs(alloc, body);
+    defer alloc.free(refs);
+    const want = [_]CalleeRef{
+        .{ .name = "start", .bare = true, .member = true },
+        .{ .name = "stop", .member = true },
+        .{ .name = "hidden", .member = true },
+        .{ .name = "init", .member = true },
+        .{ .name = "run", .bare = true },
+    };
+    try testing.expectEqual(want.len, refs.len);
+    for (want, refs) |w, r| {
+        try testing.expectEqualStrings(w.name, r.name);
+        try testing.expectEqual(w.bare, r.bare);
+        try testing.expectEqual(w.member, r.member);
     }
 }
 

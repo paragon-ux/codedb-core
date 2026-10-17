@@ -4906,6 +4906,53 @@ pub const Explorer = struct {
         self.ensureCallCentrality(allocator);
     }
 
+    /// The definitions one caller's callee name may resolve to: not the
+    /// caller itself, not a test file, the same language family, and a
+    /// method only when `methods_ok`.
+    const CalleeCandidates = struct {
+        from: codegraph.NodeId,
+        caller_path: []const u8,
+        caller_lang: Language,
+        node_path: []const []const u8,
+        node_is_method: []const bool,
+        methods_ok: bool,
+
+        const Resolution = union(enum) { none, ambiguous, edge: codegraph.NodeId };
+
+        fn allows(self: CalleeCandidates, to: codegraph.NodeId) bool {
+            if (to == self.from) return false;
+            if (!self.methods_ok and self.node_is_method[to]) return false;
+            if (isLikelyTestPath(self.node_path[to])) return false;
+            return sameLangFamily(self.caller_lang, detectLanguage(self.node_path[to]));
+        }
+
+        /// Tier 1: the one same-file definition; tier 2: the one definition
+        /// overall. More than one is ambiguous and emits no edge.
+        fn resolveOne(self: CalleeCandidates, cands: []const codegraph.NodeId) Resolution {
+            var same_file: ?codegraph.NodeId = null;
+            var same_count: usize = 0;
+            for (cands) |to| {
+                if (!self.allows(to)) continue;
+                if (!std.mem.eql(u8, self.node_path[to], self.caller_path)) continue;
+                same_count += 1;
+                if (same_count > 1) break;
+                same_file = to;
+            }
+            if (same_count == 1) return .{ .edge = same_file.? };
+
+            var chosen: ?codegraph.NodeId = null;
+            var count: usize = 0;
+            for (cands) |to| {
+                if (!self.allows(to)) continue;
+                count += 1;
+                if (count > 1) break;
+                chosen = to;
+            }
+            if (count == 1) return .{ .edge = chosen.? };
+            return if (count > 1) .ambiguous else .none;
+        }
+    };
+
     /// Build the resolved call graph once (idempotent, mutex-guarded). Must be
     /// called while holding at least a shared lock on `mu`. Retains edges for
     /// codedb_callpath and computes per-file centrality (PageRank by default).
@@ -4927,6 +4974,7 @@ pub const Explorer = struct {
         var node_path: std.ArrayList([]const u8) = .empty;
         var node_name: std.ArrayList([]const u8) = .empty;
         var node_line: std.ArrayList(u32) = .empty;
+        var node_is_method: std.ArrayList(bool) = .empty;
         var funcs: std.ArrayList(codegraph.FuncInput) = .empty;
         var name_to_ids = std.StringHashMap(std.ArrayList(codegraph.NodeId)).init(a);
 
@@ -4953,6 +5001,7 @@ pub const Explorer = struct {
                 node_path.append(a, path) catch return;
                 node_name.append(a, sym.name) catch return;
                 node_line.append(a, sym.line_start) catch return;
+                node_is_method.append(a, sym.kind == .method) catch return;
                 funcs.append(a, .{ .id = id, .body = skipOwnName(content[start..end], sym.name) }) catch return;
                 const gop = name_to_ids.getOrPut(sym.name) catch return;
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -4983,50 +5032,50 @@ pub const Explorer = struct {
         for (funcs.items) |f| {
             const caller_path = node_path.items[f.id];
             const caller_lang = detectLanguage(caller_path);
-            const callees = codegraph.extractCallees(a, f.body) catch continue;
-            for (callees) |name| {
-                if (isUbiquitousName(name)) continue;
-                const cands = resolve.get(name) orelse continue;
+            // TS/JS: a method is only reachable through a receiver, so a bare
+            // `name(` resolves among the other definitions and `obj.name(` /
+            // `this.name(` among all of them. Other languages keep one pass
+            // over every candidate.
+            const receiver_aware = caller_lang == .typescript or caller_lang == .javascript;
+            const callees = codegraph.extractCalleeRefs(a, f.body) catch continue;
+            for (callees) |callee| {
+                if (isUbiquitousName(callee.name)) continue;
+                const cands = resolve.get(callee.name) orelse continue;
 
-                // Tier 1: same-file helper.
-                var same_file: ?codegraph.NodeId = null;
-                var same_count: usize = 0;
-                for (cands) |to| {
-                    if (to == f.id) continue;
-                    if (isLikelyTestPath(node_path.items[to])) continue;
-                    if (!sameLangFamily(caller_lang, detectLanguage(node_path.items[to]))) continue;
-                    if (!std.mem.eql(u8, node_path.items[to], caller_path)) continue;
-                    same_count += 1;
-                    if (same_count > 1) break;
-                    same_file = to;
-                }
-                if (same_count == 1) {
-                    edges_tmp.append(a, .{ .from = f.id, .to = same_file.?, .weight = 1.0 }) catch return;
-                    continue;
-                }
-
-                // Tier 2: globally unique name (non-test).
-                var chosen: ?codegraph.NodeId = null;
-                var count: usize = 0;
-                for (cands) |to| {
-                    if (to == f.id) continue;
-                    if (isLikelyTestPath(node_path.items[to])) continue;
-                    if (!sameLangFamily(caller_lang, detectLanguage(node_path.items[to]))) continue;
-                    count += 1;
-                    if (count > 1) break;
-                    chosen = to;
-                }
-                if (count == 1) {
-                    edges_tmp.append(a, .{ .from = f.id, .to = chosen.?, .weight = 1.0 }) catch return;
-                } else if (count > 1 or same_count > 1) {
-                    dropped_callees[f.id] += 1;
-                    for (cands) |to| {
-                        if (to != f.id and !isLikelyTestPath(node_path.items[to]) and
-                            sameLangFamily(caller_lang, detectLanguage(node_path.items[to])))
-                        {
-                            dropped_callers[to] += 1;
-                        }
+                var cand: CalleeCandidates = .{
+                    .from = f.id,
+                    .caller_path = caller_path,
+                    .caller_lang = caller_lang,
+                    .node_path = node_path.items,
+                    .node_is_method = node_is_method.items,
+                    .methods_ok = true,
+                };
+                var resolved: ?codegraph.NodeId = null;
+                var ambiguous_with_methods: ?bool = null;
+                for ([_]bool{ true, false }) |methods_ok| {
+                    if (receiver_aware) {
+                        if (if (methods_ok) !callee.member else !callee.bare) continue;
+                    } else if (!methods_ok) continue;
+                    cand.methods_ok = methods_ok;
+                    switch (cand.resolveOne(cands)) {
+                        .edge => |to| {
+                            if (resolved == null or resolved.? != to) {
+                                edges_tmp.append(a, .{ .from = f.id, .to = to, .weight = 1.0 }) catch return;
+                            }
+                            resolved = to;
+                        },
+                        .ambiguous => {
+                            if (ambiguous_with_methods == null) ambiguous_with_methods = methods_ok;
+                        },
+                        .none => {},
                     }
+                }
+                // Counted once per name, only when no call shape resolved.
+                if (resolved != null) continue;
+                cand.methods_ok = ambiguous_with_methods orelse continue;
+                dropped_callees[f.id] += 1;
+                for (cands) |to| {
+                    if (cand.allows(to)) dropped_callers[to] += 1;
                 }
             }
         }

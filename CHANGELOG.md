@@ -8,11 +8,12 @@
   - Not nodes: overload and abstract signatures ending in `;`, interface and type-literal members, and control-flow or call lines.
   - Callables nested inside another function's body aren't added, because their calls already belong to that function.
   - An expression-bodied arrow ends where its expression ends instead of taking the next brace block in the file.
+- **TS/JS calls without a receiver never resolve to a method.** A method is reachable only through `obj.name(`, `this.name(`, or `super.name(`. A bare `start()` now resolves among free functions and arrow consts only, so a parameter named `start` no longer gets an edge to `WaymarkDaemon.start`. Also, a bare `stop()` beside a same-named method now reaches the free function instead of being ambiguous. Calls with a receiver keep every candidate, ambiguous names still emit no edge, and other languages resolve as before. `extractCalleeRefs` reports each callee's bare and receiver calls; `extractCallees` is unchanged.
 - **A declaration's own name no longer counts as a call** (all languages). Call-graph bodies start at the declaration line, so the `foo` in `fn foo(`, `def foo(`, or `async foo(` counted as a call to `foo`. When exactly one other definition of that name existed, this made a false edge, such as two unrelated `canonicalRoot` functions each calling the other. Nested `function helper(` and `fn lt(` declarations no longer count as calls either.
 - **TS/JS spans past multi-line template literals.** Skipping a template literal didn't count its newlines, so a function containing one ended early and lost the calls after it.
 - **Destructured parameters in typed TS arrows.** In `handler: ({ a }) => {` and `cb: T = ({ a }) => {`, the parameter's brace was taken as the body.
 - Lines like `parse(type: string) {` are no longer recorded as a `type_alias` named after the method.
-- **Tests**: `zig build test` now also runs `src/ts_callgraph_test.zig` (each shape above, the call graph across two files, and negative cases) and the `codegraph.zig` unit test, which was never part of the test build before.
+- **Tests**: `zig build test` now also runs `src/ts_callgraph_test.zig` (each shape above, the call graph across two files, bare and receiver calls, and negative cases) and the `codegraph.zig` unit tests, which were never part of the test build before.
 
 ## 2.0.2
 

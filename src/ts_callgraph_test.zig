@@ -153,6 +153,102 @@ test "ts call graph: a method's own signature is not a call to its namesake" {
     try testing.expectEqual(@as(usize, 0), ex.call_graph.?.edges.len);
 }
 
+const Node = struct { path: []const u8, name: []const u8, line: u32 };
+
+/// Index `files`, build the call graph, and report whether it has `from -> to`.
+fn graphHasEdge(files: []const [2][]const u8, from: Node, to: Node) !bool {
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    for (files) |f| try ex.indexFile(f[0], f[1]);
+    const steps = try ex.callersOf("__build_graph__", testing.allocator, 1);
+    testing.allocator.free(steps);
+    const cg = ex.call_graph.?;
+    for (cg.edges) |e| {
+        if (nodeIs(cg, e.from, from) and nodeIs(cg, e.to, to)) return true;
+    }
+    return false;
+}
+
+fn nodeIs(cg: explore.CallGraph, id: u32, n: Node) bool {
+    return cg.node_line[id] == n.line and std.mem.eql(u8, cg.node_path[id], n.path) and std.mem.eql(u8, cg.node_name[id], n.name);
+}
+
+const daemon_ts =
+    \\export class WaymarkDaemon {
+    \\  async start(): Promise<boolean> {
+    \\    return true;
+    \\  }
+    \\}
+    \\
+;
+
+const stub_ts =
+    \\import { WaymarkDaemon } from "./daemon";
+    \\
+    \\export async function withDaemonStub(start: () => Promise<boolean>): Promise<boolean> {
+    \\  return start();
+    \\}
+    \\
+    \\export async function launch(daemon: WaymarkDaemon): Promise<boolean> {
+    \\  return daemon.start();
+    \\}
+    \\
+;
+
+test "ts call graph: a bare call never resolves to a method" {
+    // `start()` calls the parameter; only `daemon.start()` can reach the method.
+    const files = [_][2][]const u8{ .{ "src/daemon.ts", daemon_ts }, .{ "src/stub.ts", stub_ts } };
+    const method: Node = .{ .path = "src/daemon.ts", .name = "start", .line = 2 };
+    try testing.expect(!try graphHasEdge(&files, .{ .path = "src/stub.ts", .name = "withDaemonStub", .line = 3 }, method));
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/stub.ts", .name = "launch", .line = 7 }, method));
+}
+
+test "ts call graph: this.method() resolves to the same file's method" {
+    const a_ts =
+        \\export class A {
+        \\  start(): number {
+        \\    return 1;
+        \\  }
+        \\  run(): number {
+        \\    return this.start();
+        \\  }
+        \\}
+        \\
+    ;
+    const b_ts =
+        \\export class B {
+        \\  start(): number {
+        \\    return 2;
+        \\  }
+        \\}
+        \\
+    ;
+    const files = [_][2][]const u8{ .{ "src/a.ts", a_ts }, .{ "src/b.ts", b_ts } };
+    const run: Node = .{ .path = "src/a.ts", .name = "run", .line = 5 };
+    try testing.expect(try graphHasEdge(&files, run, .{ .path = "src/a.ts", .name = "start", .line = 2 }));
+    try testing.expect(!try graphHasEdge(&files, run, .{ .path = "src/b.ts", .name = "start", .line = 2 }));
+}
+
+test "ts call graph: a bare call reaches the free function beside a same-name method" {
+    // Before, `stop()` had two same-file candidates and emitted nothing.
+    const src =
+        \\export function stop(): void {}
+        \\export class S {
+        \\  stop(): void {
+        \\    return;
+        \\  }
+        \\}
+        \\export function shutdown(): void {
+        \\  stop();
+        \\}
+        \\
+    ;
+    const files = [_][2][]const u8{.{ "src/stop.ts", src }};
+    const shutdown: Node = .{ .path = "src/stop.ts", .name = "shutdown", .line = 7 };
+    try testing.expect(try graphHasEdge(&files, shutdown, .{ .path = "src/stop.ts", .name = "stop", .line = 1 }));
+    try testing.expect(!try graphHasEdge(&files, shutdown, .{ .path = "src/stop.ts", .name = "stop", .line = 3 }));
+}
+
 test "ts outline: the repro's callables and their kinds" {
     try expectCallables("src/use.ts", use_ts, &.{
         .{ .name = "viaFunction", .kind = .function, .start = 3, .end = 5 },
