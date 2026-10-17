@@ -1,6 +1,6 @@
 # @paragon-ux/codedb-core
 
-## [Unreleased]
+## 2.1.0
 
 - **TypeScript and JavaScript callers inside class methods, object-literal functions, and arrow consts.** Only `.function` and `.method` symbols are call-graph nodes. The TS/JS outline produced no symbol for class methods (`async start() {`) or function-valued object properties (`handler: async (args) => {`), and recorded arrow-function consts as `.constant`, so `callers`, `callees`, and `neighbors` had no caller for the calls inside them. These are now nodes:
   - `.method`: class members (including constructors, `get`/`set`, `static`, `async`, `*` generators, `#private` names, access modifiers, arrow-valued fields such as `onExit = () => this.stop();`, and multi-line parameter lists), plus function-valued object properties and shorthand methods (`plain(args) {`).
