@@ -8,7 +8,22 @@
   - A name that resolves to one node is never reported as ambiguous, even when it has no callers or callees.
   - `symbol` is unchanged: it lists definitions and doesn't resolve a name.
   - In the library, `CallGraph.lookup` does the resolution, and `StepsWithStats.resolved` reports whether `callersOfWithStats`/`calleesOfWithStats` resolved the name.
-- **Tests**: `src/ts_callgraph_test.zig` covers a src function with same-named test mocks, two src definitions with a mock, and mocks only. `src/neighbors_json_test.zig` checks the CLI JSON for a resolved name with and without neighbors.
+- **A test file's calls reach its own helpers.** Edge resolution skipped test-file definitions in every tier. So a test file calling its own `ask(...)` helper got an edge to `src/capnAdapter.ts`'s `ask`, which then listed the test file among its callers.
+  - In the same-file tier, a caller now resolves to a definition in its own file even when that file is a test file.
+  - Several same-file definitions are ambiguous and emit no edge. Before, the global tier then picked a lone src definition.
+  - The global tier still skips test files, so a src caller never resolves into a test file.
+- **TS/JS keywords count only as whole words in code.** The outline's keyword sniff matched `function`, `class`, `const` and the other declaration keywords anywhere on a line, inside strings, template literals and comments too. It then named a symbol after the line's first identifier. For example, `assert.deepEqual(x, ["function launch"])` became a function `assert` whose span absorbed the calls after it. `const traceRes = q({ functionName: "x" })` and `const t = \`function x() {\`` became functions instead of constants, and `helper.class = 1` became a class.
+  - A keyword now counts only outside strings, templates and comments, and only as a whole word that isn't a property (`x.class`).
+  - It must be followed by whitespace. `function` may also be followed by `(` or `*`, so `type:` keys don't count.
+  - Generators now have nodes: `async function* gen(` and `function *gen(`.
+  - Svelte, Vue and Astro script lines get the whole-word rule but aren't masked.
+- **A regex inside a template interpolation no longer masks the rest of the file.** In `` `"${value.replace(/["^&|<>]/gu, "^$&")}"` ``, the `"` inside the regex opened a string that swallowed the `}`. The closing backtick then opened a template that never closed, so the TS/JS masker blanked every later line. Interpolations now skip regex literals the way code outside templates does. The masked lines had hidden class members and object-literal functions after such a line. With keywords now read from masked code, they would also have hidden every later `function` declaration.
+- **Tests**:
+  - `src/ts_callgraph_test.zig` covers name lookup for a src function with same-named test mocks, two src definitions with a mock, and mocks only.
+  - It also covers a test file's calls to its own helpers, with two same-file definitions and with a src caller.
+  - It also covers the keyword rule, with the false nodes from the Waymark repo and each genuine form: `export default function`, generators, `const f = function () {`, `handler: function (args) {`.
+  - It also covers a regex inside a template interpolation, and division inside one.
+  - `src/neighbors_json_test.zig` checks the CLI JSON for a resolved name with and without neighbors.
 
 ## 2.1.0
 

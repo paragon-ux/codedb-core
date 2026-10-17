@@ -951,8 +951,8 @@ test "ts outline: strings, templates, regexes and comments do not shift scopes" 
 }
 
 test "ts outline: a keyword inside a string does not hide the next member" {
-    // The keyword sniff still records `throw` as a .function (unchanged),
-    // with a span reaching into `next`; it must not count as enclosing it.
+    // A keyword in a string declares nothing: no `throw` function whose
+    // span would reach into `next`.
     const src =
         \\export class E {
         \\  check() {
@@ -967,7 +967,6 @@ test "ts outline: a keyword inside a string does not hide the next member" {
     ;
     try expectCallables("src/strings.ts", src, &.{
         .{ .name = "check", .kind = .method, .start = 2, .end = 4 },
-        .{ .name = "throw", .kind = .function, .start = 3, .end = 8 },
         .{ .name = "next", .kind = .method, .start = 6, .end = 8 },
     });
 }
@@ -989,5 +988,156 @@ test "js outline: object shorthand methods and class methods" {
     try expectCallables("lib/queue.js", src, &.{
         .{ .name = "start", .kind = .method, .start = 2, .end = 4 },
         .{ .name = "push", .kind = .method, .start = 7, .end = 9 },
+    });
+}
+
+const ask_src_ts =
+    \\export function ask(q: string): string {
+    \\  return q;
+    \\}
+    \\export function route(): string {
+    \\  return ask("x");
+    \\}
+    \\export function useMock(): number {
+    \\  return mockOnly();
+    \\}
+    \\
+;
+
+/// A test file's own helpers, called from an anonymous test callback.
+const ask_test_ts =
+    \\async function ask(server: unknown, id: number): Promise<string> {
+    \\  return "x";
+    \\}
+    \\function mockOnly(): number {
+    \\  return 1;
+    \\}
+    \\test("asks", async () => {
+    \\  await ask(null, 1);
+    \\  mockOnly();
+    \\});
+    \\
+;
+
+test "ts call graph: a test file's call reaches its own helper, never src through it" {
+    const files = [_][2][]const u8{ .{ "src/ask.ts", ask_src_ts }, .{ "test/ask.test.ts", ask_test_ts } };
+    const test_module: Node = .{ .path = "test/ask.test.ts", .name = "<module>", .line = 1 };
+    const src_ask: Node = .{ .path = "src/ask.ts", .name = "ask", .line = 1 };
+    try testing.expect(try graphHasEdge(&files, test_module, .{ .path = "test/ask.test.ts", .name = "ask", .line = 1 }));
+    try testing.expect(try graphHasEdge(&files, test_module, .{ .path = "test/ask.test.ts", .name = "mockOnly", .line = 4 }));
+    try testing.expect(!try graphHasEdge(&files, test_module, src_ask));
+    try testing.expect(try graphHasEdge(&files, .{ .path = "src/ask.ts", .name = "route", .line = 4 }, src_ask));
+    // A src caller never resolves into a test file.
+    try testing.expect(!try graphHasEdge(&files, .{ .path = "src/ask.ts", .name = "useMock", .line = 7 }, .{ .path = "test/ask.test.ts", .name = "mockOnly", .line = 4 }));
+
+    // src `ask` loses the false test caller.
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    for (files) |f| try ex.indexFile(f[0], f[1]);
+    const callers = try ex.callersOf("ask", testing.allocator, 50);
+    defer freeSteps(callers);
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("route", callers[0].name);
+}
+
+test "ts call graph: two same-file definitions in a test file emit no edge" {
+    const dup_test_ts =
+        \\const a = {
+        \\  dup: () => {
+        \\    return 1;
+        \\  },
+        \\};
+        \\const b = {
+        \\  dup: () => {
+        \\    return 2;
+        \\  },
+        \\};
+        \\test("dups", () => {
+        \\  a.dup();
+        \\});
+        \\
+    ;
+    const dup_src_ts =
+        \\export function dup(): number {
+        \\  return 3;
+        \\}
+        \\
+    ;
+    const files = [_][2][]const u8{ .{ "src/dup.ts", dup_src_ts }, .{ "test/dup.test.ts", dup_test_ts } };
+    const test_module: Node = .{ .path = "test/dup.test.ts", .name = "<module>", .line = 1 };
+    // Ambiguous in its own file: no fallback to the src definition.
+    try testing.expect(!try graphHasEdge(&files, test_module, .{ .path = "src/dup.ts", .name = "dup", .line = 1 }));
+    try testing.expect(!try graphHasEdge(&files, test_module, .{ .path = "test/dup.test.ts", .name = "dup", .line = 2 }));
+    try testing.expect(!try graphHasEdge(&files, test_module, .{ .path = "test/dup.test.ts", .name = "dup", .line = 7 }));
+}
+
+test "ts outline: a keyword counts only as a whole word in code" {
+    const src =
+        \\export default function main() {
+        \\  return 1;
+        \\}
+        \\async function* gen() {
+        \\  yield 1;
+        \\}
+        \\export async function *agen() {
+        \\  yield 2;
+        \\}
+        \\const f = function () {
+        \\  return 2;
+        \\};
+        \\const obj = {
+        \\  handler: function (args) {
+        \\    return args;
+        \\  },
+        \\};
+        \\test("x", async () => {
+        \\  const i2 = detectAstIntent("Where is function publish declared?");
+        \\  assert.deepEqual(start.callers!.map(brief), ["function launch src/app.ts:2"]);
+        \\  const traceRes = await queryStructural({ requiresParser: true, tool: "trace_path", functionName: "capnChartArgs" }, waymarkRoot);
+        \\  // function commented() {
+        \\  const t = `function inTemplate() {`;
+        \\  helper.class = 1;
+        \\  assert.ok(x, "no function here");
+        \\});
+        \\
+    ;
+    try expectCallables("test/forms.test.ts", src, &.{
+        .{ .name = "main", .kind = .function, .start = 1, .end = 3 },
+        .{ .name = "gen", .kind = .function, .start = 4, .end = 6 },
+        .{ .name = "agen", .kind = .function, .start = 7, .end = 9 },
+        .{ .name = "f", .kind = .function, .start = 10, .end = 12 },
+        .{ .name = "handler", .kind = .method, .start = 14, .end = 16 },
+    });
+    try expectKind("test/forms.test.ts", src, "i2", 19, .constant);
+    try expectKind("test/forms.test.ts", src, "traceRes", 21, .constant);
+    try expectKind("test/forms.test.ts", src, "t", 23, .constant);
+
+    var parsed = try Explorer.parseContentForIndexing(testing.allocator, "test/forms.test.ts", src);
+    defer parsed.deinit();
+    for (parsed.outline.symbols.items) |s| {
+        errdefer std.debug.print("unexpected symbol {s} on line {d}\n", .{ s.name, s.line_start });
+        try testing.expect(!std.mem.eql(u8, s.name, "assert") and !std.mem.eql(u8, s.name, "helper"));
+    }
+}
+
+test "ts outline: a regex in a template interpolation does not mask the rest of the file" {
+    // The `"` in `/["^&|<>]/` once opened a string that swallowed the `}`,
+    // and the closing backtick then opened a template that never closed.
+    const src =
+        \\function quote(value: string): string {
+        \\  return `"${value.replace(/["^&|<>]/gu, "^$&")}"`;
+        \\}
+        \\function after(): number {
+        \\  return `${(1 + 2) / 3}`.length;
+        \\}
+        \\function last(): number {
+        \\  return 1;
+        \\}
+        \\
+    ;
+    try expectCallables("src/quote.ts", src, &.{
+        .{ .name = "quote", .kind = .function, .start = 1, .end = 3 },
+        .{ .name = "after", .kind = .function, .start = 4, .end = 6 },
+        .{ .name = "last", .kind = .function, .start = 7, .end = 9 },
     });
 }

@@ -4993,8 +4993,8 @@ pub const Explorer = struct {
     }
 
     /// The definitions one caller's callee name may resolve to: not the
-    /// caller itself, not a test file, the same language family, and a
-    /// method only when `methods_ok`.
+    /// caller itself, the same language family, a method only when
+    /// `methods_ok`, and not a test file, except in the caller's own file.
     const CalleeCandidates = struct {
         from: codegraph.NodeId,
         caller_path: []const u8,
@@ -5006,25 +5006,33 @@ pub const Explorer = struct {
         const Resolution = union(enum) { none, ambiguous, edge: codegraph.NodeId };
 
         fn allows(self: CalleeCandidates, to: codegraph.NodeId) bool {
-            if (to == self.from) return false;
-            if (!self.methods_ok and self.node_is_method[to]) return false;
+            if (!self.allowsInFile(to)) return false;
             if (isLikelyTestPath(self.node_path[to])) return false;
             return sameLangFamily(self.caller_lang, detectLanguage(self.node_path[to]));
         }
 
-        /// Tier 1: the one same-file definition; tier 2: the one definition
-        /// overall. More than one is ambiguous and emits no edge.
+        /// A definition in the caller's own file, where a test file's
+        /// helpers count: they are what its calls refer to.
+        fn allowsInFile(self: CalleeCandidates, to: codegraph.NodeId) bool {
+            if (to == self.from) return false;
+            return self.methods_ok or !self.node_is_method[to];
+        }
+
+        /// Tier 1: the one same-file definition; tier 2: the one non-test
+        /// definition overall. More than one in either tier is ambiguous and
+        /// emits no edge.
         fn resolveOne(self: CalleeCandidates, cands: []const codegraph.NodeId) Resolution {
             var same_file: ?codegraph.NodeId = null;
             var same_count: usize = 0;
             for (cands) |to| {
-                if (!self.allows(to)) continue;
                 if (!std.mem.eql(u8, self.node_path[to], self.caller_path)) continue;
+                if (!self.allowsInFile(to)) continue;
                 same_count += 1;
                 if (same_count > 1) break;
                 same_file = to;
             }
             if (same_count == 1) return .{ .edge = same_file.? };
+            if (same_count > 1) return .ambiguous;
 
             var chosen: ?codegraph.NodeId = null;
             var count: usize = 0;
@@ -6634,17 +6642,15 @@ pub const Explorer = struct {
         // keyword sniff below matches keywords anywhere on the line, so it
         // would record `parse(type: string) {` as a type_alias "parse".
         const fed: TsParseState.Fed = if (ts) |st| try st.feedLine(a, outline, line, line_num) else .{ .claimed = false, .code = line };
-        if (!fed.claimed and containsAny(line, &.{ "function ", "const ", "let ", "var ", "class ", "interface ", "enum ", "type " })) {
-            const kind = tsKeywordKind(line);
+        // Keywords count only in code (`fed.code` has strings, templates and
+        // comments blanked) and as whole words, so neither
+        // `assert.ok(x, "no function here")` nor `functionName:` declares a
+        // function. Component files have no TsParseState and are not masked.
+        if (!fed.claimed and tsHasDeclKeyword(fed.code)) {
+            const kind = tsKeywordKind(fed.code);
             const trimmed = skipKeywords(line);
             if (extractIdent(trimmed)) |name| {
                 try appendOutlineSymbol(a, outline, name, kind, line_num, line);
-                // `"not a function "` in a string still yields a .function
-                // here (kept as before), but it must not count as a body that
-                // encloses the members after it.
-                if (ts) |st| if (kind == .function and std.mem.indexOf(u8, fed.code, "function") == null) {
-                    try st.not_bodies.append(a, outline.symbols.items.len - 1);
-                };
             }
         }
         if (startsWith(line, "import ") or containsAny(line, &.{"require("})) {
@@ -9147,11 +9153,45 @@ fn skipKeywords(s: []const u8) []const u8 {
     const keywords = [_][]const u8{ "export ", "default ", "async ", "abstract ", "function ", "class ", "interface ", "enum ", "type ", "const ", "let ", "var " };
     var result = s;
     for (keywords) |kw| {
+        if (std.mem.eql(u8, kw, "function ")) {
+            // `function name(`, and generators `function* name(` / `function *name(`.
+            const n = "function".len;
+            if (std.mem.startsWith(u8, result, "function") and result.len > n and (result[n] == ' ' or result[n] == '*')) {
+                result = std.mem.trimStart(u8, result[n..], " \t*");
+            }
+            continue;
+        }
         if (std.mem.startsWith(u8, result, kw)) {
             result = result[kw.len..];
         }
     }
     return result;
+}
+
+/// The keywords parseTsLine's sniff looks for.
+const ts_decl_keywords = [_][]const u8{ "function", "const", "let", "var", "class", "interface", "enum", "type" };
+
+/// Whether `code` holds the keyword `kw`: a whole word that is not a property
+/// (`x.class`), followed by whitespace, or for `function` also by `(` or `*`.
+/// So `type:` keys and `functionName` don't count.
+fn tsHasKeyword(code: []const u8, kw: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, code, from, kw)) |p| : (from = p + 1) {
+        if (p > 0 and (tsIsIdentChar(code[p - 1]) or code[p - 1] == '.')) continue;
+        const after = p + kw.len;
+        if (after >= code.len) continue;
+        const c = code[after];
+        if (c == ' ' or c == '\t') return true;
+        if ((c == '(' or c == '*') and std.mem.eql(u8, kw, "function")) return true;
+    }
+    return false;
+}
+
+fn tsHasDeclKeyword(code: []const u8) bool {
+    for (ts_decl_keywords) |kw| {
+        if (tsHasKeyword(code, kw)) return true;
+    }
+    return false;
 }
 
 /// A call-graph body starts at its declaration line, so the name in
@@ -9171,17 +9211,18 @@ fn skipOwnName(body: []const u8, name: []const u8) []const u8 {
     return body;
 }
 
-/// parseTsLine's keyword sniff: the first keyword found anywhere on the line.
-fn tsKeywordKind(line: []const u8) SymbolKind {
-    return if (std.mem.indexOf(u8, line, "function") != null)
+/// parseTsLine's keyword sniff: the kind of the first keyword (by priority)
+/// that `code` holds, as tsHasKeyword reads it.
+fn tsKeywordKind(code: []const u8) SymbolKind {
+    return if (tsHasKeyword(code, "function"))
         .function
-    else if (std.mem.indexOf(u8, line, "class ") != null)
+    else if (tsHasKeyword(code, "class"))
         .class_def
-    else if (std.mem.indexOf(u8, line, "interface ") != null)
+    else if (tsHasKeyword(code, "interface"))
         .interface_def
-    else if (std.mem.indexOf(u8, line, "enum ") != null)
+    else if (tsHasKeyword(code, "enum"))
         .enum_def
-    else if (std.mem.indexOf(u8, line, "type ") != null)
+    else if (tsHasKeyword(code, "type"))
         .type_alias
     else
         .constant;
@@ -9315,9 +9356,6 @@ const TsParseState = struct {
     exprs: std.ArrayList(TsExprEnd) = .empty,
     new_symbols: std.ArrayList(TsNewSymbol) = .empty,
     fixed_ends: std.ArrayList(TsFixedEnd) = .empty,
-    /// Keyword-sniffed `.function` symbols whose keyword sat in a string or
-    /// comment: never treated as an enclosing body.
-    not_bodies: std.ArrayList(usize) = .empty,
     mask: std.ArrayList(u8) = .empty,
 
     const Fed = struct { claimed: bool, code: []const u8 };
@@ -9328,7 +9366,6 @@ const TsParseState = struct {
         self.exprs.deinit(a);
         self.new_symbols.deinit(a);
         self.fixed_ends.deinit(a);
-        self.not_bodies.deinit(a);
         self.mask.deinit(a);
         for (self.owners.items) |o| a.free(o);
         self.owners.deinit(a);
@@ -9438,7 +9475,7 @@ const TsParseState = struct {
 
         const name = code[cand.name_start..cand.name_end];
         if (cand.decl) {
-            const legacy = tsKeywordKind(line);
+            const legacy = tsKeywordKind(code);
             try appendOutlineSymbol(a, outline, name, legacy, line_num, line);
             sig.index = outline.symbols.items.len - 1;
             sig.exists = true;
@@ -9573,6 +9610,8 @@ const TsParseState = struct {
             const top = &self.templates[self.template_len - 1];
             const c = m[i];
             if (top.*) |depth| {
+                // An interpolation is code: strings and regex literals in it
+                // must not end it (`${s.replace(/["]/g, "")}`).
                 switch (c) {
                     '{' => top.* = depth + 1,
                     '}' => top.* = if (depth == 0) null else depth - 1,
@@ -9584,10 +9623,22 @@ const TsParseState = struct {
                         const end = tsMaskString(m, i);
                         @memset(m[i..end], ' ');
                         i = end;
+                        self.mask_prev = c;
                         continue;
+                    },
+                    '/' => if (tsRegexAllowed(m, i, self.mask_prev)) {
+                        if (tsRegexEnd(m, i)) |end| {
+                            var j = end + 1;
+                            while (j < m.len and tsIsIdentChar(m[j])) j += 1; // flags
+                            @memset(m[i..j], ' ');
+                            i = j;
+                            self.mask_prev = ')'; // a regex is a value
+                            continue;
+                        }
                     },
                     else => {},
                 }
+                if (c != ' ' and c != '\t') self.mask_prev = c;
                 m[i] = ' ';
                 i += 1;
                 continue;
@@ -9610,6 +9661,7 @@ const TsParseState = struct {
             }
             if (c == '$' and i + 1 < m.len and m[i + 1] == '{') {
                 top.* = 0;
+                self.mask_prev = '{';
                 m[i] = ' ';
                 m[i + 1] = ' ';
                 i += 2;
@@ -9696,15 +9748,12 @@ const TsParseState = struct {
                 return x.index < y.index;
             }
         }.lt);
-        std.mem.sort(usize, self.not_bodies.items, {}, std.sort.asc(usize));
 
         var ni: usize = 0;
-        var bi: usize = 0;
         var enc_end: u32 = 0;
         var dropped = false;
         for (syms, 0..) |*sym, si| {
             while (ni < self.new_symbols.items.len and self.new_symbols.items[ni].index < si) ni += 1;
-            while (bi < self.not_bodies.items.len and self.not_bodies.items[bi] < si) bi += 1;
             if (sym.kind != .function and sym.kind != .method) continue;
             const new = ni < self.new_symbols.items.len and self.new_symbols.items[ni].index == si;
             if (new and sym.line_start <= enc_end) {
@@ -9720,8 +9769,7 @@ const TsParseState = struct {
                 }
                 continue;
             }
-            const not_body = bi < self.not_bodies.items.len and self.not_bodies.items[bi] == si;
-            if (!not_body) enc_end = @max(enc_end, sym.line_end);
+            enc_end = @max(enc_end, sym.line_end);
         }
         if (!dropped) return;
         var w: usize = 0;
