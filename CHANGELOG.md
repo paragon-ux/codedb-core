@@ -1,5 +1,19 @@
 # @paragon-ux/codedb-core
 
+## [Unreleased]
+
+- **TypeScript and JavaScript callers inside class methods, object-literal functions, and arrow consts.** Only `.function` and `.method` symbols are call-graph nodes. The TS/JS outline produced no symbol for class methods (`async start() {`) or function-valued object properties (`handler: async (args) => {`), and recorded arrow-function consts as `.constant`, so `callers`, `callees`, and `neighbors` had no caller for the calls inside them. These are now nodes:
+  - `.method`: class members (including constructors, `get`/`set`, `static`, `async`, `*` generators, `#private` names, access modifiers, arrow-valued fields such as `onExit = () => this.stop();`, and multi-line parameter lists), plus function-valued object properties and shorthand methods (`plain(args) {`).
+  - `.function`: `const`/`let`/`var` whose value is an arrow function.
+  - Not nodes: overload and abstract signatures ending in `;`, interface and type-literal members, and control-flow or call lines.
+  - Callables nested inside another function's body aren't added, because their calls already belong to that function.
+  - An expression-bodied arrow ends where its expression ends instead of taking the next brace block in the file.
+- **A declaration's own name no longer counts as a call** (all languages). Call-graph bodies start at the declaration line, so the `foo` in `fn foo(`, `def foo(`, or `async foo(` counted as a call to `foo`. When exactly one other definition of that name existed, this made a false edge, such as two unrelated `canonicalRoot` functions each calling the other. Nested `function helper(` and `fn lt(` declarations no longer count as calls either.
+- **TS/JS spans past multi-line template literals.** Skipping a template literal didn't count its newlines, so a function containing one ended early and lost the calls after it.
+- **Destructured parameters in typed TS arrows.** In `handler: ({ a }) => {` and `cb: T = ({ a }) => {`, the parameter's brace was taken as the body.
+- Lines like `parse(type: string) {` are no longer recorded as a `type_alias` named after the method.
+- **Tests**: `zig build test` now also runs `src/ts_callgraph_test.zig` (each shape above, the call graph across two files, and negative cases) and the `codegraph.zig` unit test, which was never part of the test build before.
+
 ## 2.0.2
 
 - **`codedb --version` reports this package's version.** Through 2.0.1 it printed `codedb 0.2.5828`, a constant inherited from upstream `justrach/codedb`. `build.zig` now reads `version` from `package.json` and builds it into the binary, so the two can't drift; a missing or non-semver version fails the build. Queries and output are otherwise unchanged.

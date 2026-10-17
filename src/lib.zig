@@ -40,7 +40,8 @@ pub const watcher = @import("watcher.zig");
 
 test {
     // The root's decls are analyzed lazily, so pull in the unit tests that
-    // guard on-disk naming explicitly.
+    // guard on-disk naming and TS/JS call-graph nodes explicitly.
     _ = @import("state_paths.zig");
     _ = @import("config.zig");
+    _ = @import("ts_callgraph_test.zig");
 }

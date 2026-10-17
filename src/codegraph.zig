@@ -48,6 +48,20 @@ fn isCallKeyword(name: []const u8) bool {
     return false;
 }
 
+/// True when the identifier at `start` is the name in a declaration such as
+/// `function name(`, `function* name(`, `fn name(` or `def name(`.
+fn followsDeclKeyword(body: []const u8, start: usize) bool {
+    var e = start;
+    while (e > 0 and (body[e - 1] == ' ' or body[e - 1] == '\t' or body[e - 1] == '*')) e -= 1;
+    if (e == start) return false;
+    var s = e;
+    while (s > 0 and isIdentChar(body[s - 1])) s -= 1;
+    const word = body[s..e];
+    const kws = [_][]const u8{ "function", "fn", "def", "func", "fun" };
+    for (kws) |kw| if (std.mem.eql(u8, word, kw)) return true;
+    return false;
+}
+
 inline fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
 }
@@ -149,6 +163,7 @@ pub fn extractCallees(allocator: std.mem.Allocator, body: []const u8) ![][]const
         const name = body[start..end];
         if (!isIdentStart(name[0])) continue; // started on a digit → not an ident
         if (isCallKeyword(name)) continue;
+        if (followsDeclKeyword(body, start)) continue; // `function helper(` declares, not calls
         const g = try seen.getOrPut(name);
         if (!g.found_existing) try out.append(allocator, name);
     }

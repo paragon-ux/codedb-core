@@ -1846,6 +1846,8 @@ pub const Explorer = struct {
             // JS/TS template literals: skip the whole literal (balanced `${}`).
             if (is_js_ts and c == '`') {
                 const after = skipJsTemplateLiteral(content, i);
+                // The skipped literal's newlines still end lines.
+                current_line += @intCast(std.mem.count(u8, content[i..@min(after, content.len)], "\n"));
                 i = if (after > i) after - 1 else i;
                 continue;
             }
@@ -1896,7 +1898,10 @@ pub const Explorer = struct {
                 return_type_started = false;
             } else if (is_ts and !found_open and in_return_type and c == ' ' or is_ts and !found_open and in_return_type and c == '\t') {
                 // whitespace within the return type does not start it
-            } else if (is_ts and !found_open and in_return_type) {
+            } else if (is_ts and !found_open and in_return_type and paren_depth == 0) {
+                // `handler: ({ a }) => {` / `cb: T = ({ a }) => {`: the ':'
+                // after the name looks like a return type, so braces inside
+                // the parameter list (paren_depth > 0) must not end it.
                 if (c == '<') {
                     type_angle_depth += 1;
                     return_type_started = true;
@@ -2030,6 +2035,8 @@ pub const Explorer = struct {
         var line_num: u32 = 0;
         var prev_line_trimmed: []const u8 = "";
         var php_state: PhpParseState = .{};
+        var ts_state: TsParseState = .{};
+        defer ts_state.deinit(parser.allocator);
         var in_py_docstring = false;
         var in_block_comment = false;
         var in_go_import_block = false;
@@ -2107,7 +2114,7 @@ pub const Explorer = struct {
             } else if (outline.language == .python) {
                 try parser.parsePythonLine(trimmed, line_num, &outline);
             } else if (outline.language == .typescript or outline.language == .javascript) {
-                try parser.parseTsLine(trimmed, line_num, &outline);
+                try parser.parseTsLine(trimmed, line_num, &outline, &ts_state);
             } else if (outline.language == .c or outline.language == .cpp) {
                 try parser.parseCLine(line, trimmed, line_num, &outline, prev_line_trimmed, &c_brace_depth);
             } else if (outline.language == .rust) {
@@ -2167,6 +2174,9 @@ pub const Explorer = struct {
         }
         outline.line_count = line_num;
         computeSymbolEnds(content, &outline);
+        if (outline.language == .typescript or outline.language == .javascript) {
+            try ts_state.finish(parser.allocator, &outline);
+        }
         return outline;
     }
 
@@ -4943,7 +4953,7 @@ pub const Explorer = struct {
                 node_path.append(a, path) catch return;
                 node_name.append(a, sym.name) catch return;
                 node_line.append(a, sym.line_start) catch return;
-                funcs.append(a, .{ .id = id, .body = content[start..end] }) catch return;
+                funcs.append(a, .{ .id = id, .body = skipOwnName(content[start..end], sym.name) }) catch return;
                 const gop = name_to_ids.getOrPut(sym.name) catch return;
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 gop.value_ptr.append(a, id) catch return;
@@ -6375,24 +6385,24 @@ pub const Explorer = struct {
             }
         }
     }
-    fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+    /// `ts` is null for Svelte/Vue/Astro lines, which keep the keyword sniff only.
+    fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline, ts: ?*TsParseState) !void {
         const a = self.allocator;
-        if (containsAny(line, &.{ "function ", "const ", "let ", "var ", "class ", "interface ", "enum ", "type " })) {
-            const kind: SymbolKind = if (std.mem.indexOf(u8, line, "function") != null)
-                .function
-            else if (std.mem.indexOf(u8, line, "class ") != null)
-                .class_def
-            else if (std.mem.indexOf(u8, line, "interface ") != null)
-                .interface_def
-            else if (std.mem.indexOf(u8, line, "enum ") != null)
-                .enum_def
-            else if (std.mem.indexOf(u8, line, "type ") != null)
-                .type_alias
-            else
-                .constant;
+        // Methods, function-valued properties and arrow consts first: the
+        // keyword sniff below matches keywords anywhere on the line, so it
+        // would record `parse(type: string) {` as a type_alias "parse".
+        const fed: TsParseState.Fed = if (ts) |st| try st.feedLine(a, outline, line, line_num) else .{ .claimed = false, .code = line };
+        if (!fed.claimed and containsAny(line, &.{ "function ", "const ", "let ", "var ", "class ", "interface ", "enum ", "type " })) {
+            const kind = tsKeywordKind(line);
             const trimmed = skipKeywords(line);
             if (extractIdent(trimmed)) |name| {
                 try appendOutlineSymbol(a, outline, name, kind, line_num, line);
+                // `"not a function "` in a string still yields a .function
+                // here (kept as before), but it must not count as a body that
+                // encloses the members after it.
+                if (ts) |st| if (kind == .function and std.mem.indexOf(u8, fed.code, "function") == null) {
+                    try st.not_bodies.append(a, outline.symbols.items.len - 1);
+                };
             }
         }
         if (startsWith(line, "import ") or containsAny(line, &.{"require("})) {
@@ -6501,7 +6511,7 @@ pub const Explorer = struct {
             try self.parseStyleLine(line, line_num, outline);
             return;
         }
-        try self.parseTsLine(line, line_num, outline);
+        try self.parseTsLine(line, line_num, outline, null);
     }
 
     fn parseShellLine(self: *Explorer, raw_line: []const u8, line_num: u32, outline: *FileOutline) !void {
@@ -8900,6 +8910,948 @@ fn skipKeywords(s: []const u8) []const u8 {
         }
     }
     return result;
+}
+
+/// A call-graph body starts at its declaration line, so the name in
+/// `async start(opts) {` or `def run(self):` would read as a call, and
+/// resolve to another definition of the same name. Start past the first
+/// whole-word occurrence of `name` on that line.
+fn skipOwnName(body: []const u8, name: []const u8) []const u8 {
+    if (name.len == 0) return body;
+    const first_line = body[0 .. std.mem.indexOfScalar(u8, body, '\n') orelse body.len];
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, first_line, from, name)) |p| : (from = p + 1) {
+        const after = p + name.len;
+        if (p > 0 and tsIsIdentChar(first_line[p - 1])) continue;
+        if (after < first_line.len and tsIsIdentChar(first_line[after])) continue;
+        return body[after..];
+    }
+    return body;
+}
+
+/// parseTsLine's keyword sniff: the first keyword found anywhere on the line.
+fn tsKeywordKind(line: []const u8) SymbolKind {
+    return if (std.mem.indexOf(u8, line, "function") != null)
+        .function
+    else if (std.mem.indexOf(u8, line, "class ") != null)
+        .class_def
+    else if (std.mem.indexOf(u8, line, "interface ") != null)
+        .interface_def
+    else if (std.mem.indexOf(u8, line, "enum ") != null)
+        .enum_def
+    else if (std.mem.indexOf(u8, line, "type ") != null)
+        .type_alias
+    else
+        .constant;
+}
+
+// ── TypeScript/JavaScript callables ──────────────────────────────────────
+//
+// The call graph makes nodes only from `.function` and `.method` symbols.
+// parseTsLine's keyword sniff never produced `.method` and labels an arrow
+// const `.constant`, so class methods, function-valued object properties
+// (`handler: async (args) => {`) and arrow consts had no node, and the calls
+// inside them had no caller. TsParseState tracks just enough structure to
+// recognise them: brace scopes (class body, type body, other) and paren
+// depth, counted on a copy of each line with strings, template literals,
+// regexes and comments blanked. Members inside a function body are dropped
+// again in `finish`: their calls already belong to the enclosing function,
+// and extra same-name nodes would only make callee names ambiguous.
+
+const TsScopeKind = enum(u8) { class_body, type_body, other };
+
+const TsScope = struct {
+    kind: TsScopeKind,
+    /// Paren depth when the brace opened; restored when it closes.
+    paren_base: u32,
+};
+
+const TsSigMode = enum(u8) {
+    /// `name(...) [: T] {`: needs a block body. A `;` instead means an
+    /// overload or abstract signature, which is not a node.
+    method,
+    /// `(...) [: T] => body`.
+    arrow,
+};
+
+const TsSigOutcome = union(enum) {
+    pending,
+    rejected,
+    /// Block body: findBraceEnd computes the span.
+    block,
+    /// Expression body starting at this index of the line (== len: next line).
+    expr: usize,
+};
+
+/// A parameter list being scanned, possibly across lines.
+const TsSig = struct {
+    mode: TsSigMode,
+    phase: enum(u8) { params, after, ret_type } = .params,
+    depth: u32 = 0,
+    /// ()[]{}<> nesting inside a return type annotation.
+    nest: u32 = 0,
+    lines_left: u32 = 64,
+    /// An arrow const already sits at `index` with its keyword-sniff kind; a
+    /// member is inserted at `index` once confirmed.
+    index: usize = 0,
+    exists: bool = false,
+    kind: SymbolKind = .method,
+    /// Kind to restore if the symbol turns out nested in a function body;
+    /// null drops it.
+    fallback: ?SymbolKind = null,
+    line_num: u32 = 0,
+    /// Owned copies for a member that is not inserted yet.
+    name: ?[]u8 = null,
+    detail: ?[]u8 = null,
+
+    fn freeOwned(self: *TsSig, a: std.mem.Allocator) void {
+        if (self.name) |n| a.free(n);
+        if (self.detail) |d| a.free(d);
+        self.name = null;
+        self.detail = null;
+    }
+};
+
+/// Tracks where an expression-bodied arrow ends, so findBraceEnd does not
+/// hand it the next brace block in the file.
+const TsExprEnd = struct {
+    index: usize,
+    depth: i32 = 0,
+    started: bool = false,
+    lines_left: u32 = 64,
+};
+
+const TsNewSymbol = struct {
+    index: usize,
+    fallback: ?SymbolKind,
+};
+
+const TsFixedEnd = struct { index: usize, line_end: u32 };
+
+const TsCandidate = struct {
+    name_start: usize,
+    name_end: usize,
+    /// const/let/var (→ .function) rather than a class or object member (→ .method).
+    decl: bool,
+    mode: TsSigMode = .method,
+    /// Index of the parameter list's `(`, or just past `=>` for `x =>`.
+    pos: usize = 0,
+    single_param: bool = false,
+};
+
+const TsParseState = struct {
+    scopes: std.ArrayList(TsScope) = .empty,
+    paren_depth: u32 = 0,
+    in_block_comment: bool = false,
+    /// Open template literals: null in literal text, else the brace depth
+    /// inside the current `${...}`.
+    templates: [16]?u32 = undefined,
+    template_len: usize = 0,
+    /// Last significant char seen by the masker (regex-vs-division).
+    mask_prev: u8 = 0,
+    /// Last two significant chars seen by the brace counter.
+    prev_sig: u8 = 0,
+    prev_sig2: u8 = 0,
+    /// A `class`/`interface`/`enum`/`type` head waiting for its brace.
+    head: ?TsScopeKind = null,
+    head_paren: u32 = 0,
+    head_lines_left: u32 = 0,
+    sig: ?TsSig = null,
+    exprs: std.ArrayList(TsExprEnd) = .empty,
+    new_symbols: std.ArrayList(TsNewSymbol) = .empty,
+    fixed_ends: std.ArrayList(TsFixedEnd) = .empty,
+    /// Keyword-sniffed `.function` symbols whose keyword sat in a string or
+    /// comment: never treated as an enclosing body.
+    not_bodies: std.ArrayList(usize) = .empty,
+    mask: std.ArrayList(u8) = .empty,
+
+    const Fed = struct { claimed: bool, code: []const u8 };
+
+    fn deinit(self: *TsParseState, a: std.mem.Allocator) void {
+        if (self.sig) |*sig| sig.freeOwned(a);
+        self.scopes.deinit(a);
+        self.exprs.deinit(a);
+        self.new_symbols.deinit(a);
+        self.fixed_ends.deinit(a);
+        self.not_bodies.deinit(a);
+        self.mask.deinit(a);
+    }
+
+    /// Process one trimmed line. `claimed` means this line's symbol was
+    /// emitted here and the keyword sniff must skip it; `code` is the masked
+    /// line (valid until the next call).
+    fn feedLine(self: *TsParseState, a: std.mem.Allocator, outline: *FileOutline, line: []const u8, line_num: u32) !Fed {
+        const starts_in_code = !self.in_block_comment and self.template_len == 0;
+        const top: ?TsScope = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1] else null;
+        const line_paren = self.paren_depth;
+        const code = std.mem.trimEnd(u8, try self.maskLine(a, line), " \t\r");
+
+        var k: usize = 0;
+        while (k < self.exprs.items.len) {
+            const e = &self.exprs.items[k];
+            if (tsExprFeed(e, code, 0) or e.lines_left == 0) {
+                try self.fixed_ends.append(a, .{ .index = e.index, .line_end = line_num });
+                _ = self.exprs.swapRemove(k);
+            } else {
+                e.lines_left -= 1;
+                k += 1;
+            }
+        }
+
+        var claimed = false;
+        if (self.sig != null) {
+            const sig = &self.sig.?;
+            const outcome: TsSigOutcome = if (sig.lines_left == 0) .rejected else tsSigFeed(sig, code, 0);
+            sig.lines_left -|= 1;
+            switch (outcome) {
+                .pending => {},
+                .rejected => {
+                    sig.freeOwned(a);
+                    self.sig = null;
+                },
+                else => {
+                    var done = sig.*;
+                    self.sig = null;
+                    try self.confirm(a, outline, &done, outcome, code, line_num);
+                },
+            }
+        } else if (starts_in_code and code.len > 0) {
+            if (tsHeadKind(code)) |kind| {
+                self.head = kind;
+                self.head_paren = line_paren;
+                self.head_lines_left = 8;
+            }
+            claimed = try self.detect(a, outline, line, code, line_num, top, line_paren);
+        }
+
+        try self.countLine(a, code);
+        return .{ .claimed = claimed, .code = code };
+    }
+
+    fn detect(
+        self: *TsParseState,
+        a: std.mem.Allocator,
+        outline: *FileOutline,
+        line: []const u8,
+        code: []const u8,
+        line_num: u32,
+        top: ?TsScope,
+        line_paren: u32,
+    ) !bool {
+        // Inside a multi-line call or parameter list: not a declaration.
+        const base: u32 = if (top) |t| t.paren_base else 0;
+        if (line_paren != base) return false;
+        const top_kind: ?TsScopeKind = if (top) |t| t.kind else null;
+        const cand: TsCandidate = switch (top_kind orelse .other) {
+            .type_body => return false,
+            .class_body => tsClassMember(code),
+            .other => tsConstDecl(code) orelse if (top_kind != null) tsObjectMember(code) else null,
+        } orelse return false;
+        const in_object = !cand.decl and top_kind == .other;
+
+        var sig: TsSig = .{ .mode = cand.mode, .line_num = line_num };
+        const outcome: TsSigOutcome = if (cand.single_param) tsArrowBody(code, cand.pos) else tsSigFeed(&sig, code, cand.pos);
+        switch (outcome) {
+            .rejected => return false,
+            // In an object or a function body, `name(` spilling onto the next
+            // line is far more often a call (`run(() => {`, `wrap({`) than a
+            // shorthand method; only a list that breaks after `(` or `,` may
+            // continue.
+            .pending => if (in_object and cand.mode == .method) {
+                const last = code[code.len - 1];
+                if (last != '(' and last != ',') return false;
+            },
+            else => {},
+        }
+
+        const name = code[cand.name_start..cand.name_end];
+        if (cand.decl) {
+            const legacy = tsKeywordKind(line);
+            try appendOutlineSymbol(a, outline, name, legacy, line_num, line);
+            sig.index = outline.symbols.items.len - 1;
+            sig.exists = true;
+            sig.kind = .function;
+            sig.fallback = legacy;
+        } else {
+            sig.index = outline.symbols.items.len;
+            sig.kind = .method;
+            sig.name = try a.dupe(u8, name);
+            sig.detail = a.dupe(u8, line) catch |err| {
+                sig.freeOwned(a);
+                return err;
+            };
+        }
+        if (outcome == .pending) {
+            self.sig = sig;
+        } else {
+            try self.confirm(a, outline, &sig, outcome, code, line_num);
+        }
+        return true;
+    }
+
+    fn confirm(self: *TsParseState, a: std.mem.Allocator, outline: *FileOutline, sig: *TsSig, outcome: TsSigOutcome, code: []const u8, line_num: u32) !void {
+        if (sig.exists) {
+            outline.symbols.items[sig.index].kind = sig.kind;
+        } else {
+            errdefer sig.freeOwned(a);
+            const name = sig.name.?;
+            try outline.symbols.insert(a, sig.index, .{
+                .name = name,
+                .kind = sig.kind,
+                .line_start = sig.line_num,
+                .line_end = sig.line_num,
+                .detail = sig.detail,
+            });
+            outline.name_len_mask |= FileOutline.nameLenBit(name.len);
+            sig.name = null;
+            sig.detail = null;
+        }
+        try self.new_symbols.append(a, .{ .index = sig.index, .fallback = sig.fallback });
+        switch (outcome) {
+            .expr => |pos| {
+                var e: TsExprEnd = .{ .index = sig.index };
+                if (pos < code.len and tsExprFeed(&e, code, pos)) {
+                    try self.fixed_ends.append(a, .{ .index = sig.index, .line_end = line_num });
+                } else {
+                    try self.exprs.append(a, e);
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Copy `line` into `mask` with comment, string, template-literal and
+    /// regex contents blanked (quotes, backticks and slashes stay), carrying
+    /// block comments and template literals across lines.
+    fn maskLine(self: *TsParseState, a: std.mem.Allocator, line: []const u8) ![]u8 {
+        self.mask.clearRetainingCapacity();
+        try self.mask.appendSlice(a, line);
+        const m = self.mask.items;
+        var i: usize = 0;
+        while (i < m.len) {
+            if (self.in_block_comment) {
+                if (m[i] == '*' and i + 1 < m.len and m[i + 1] == '/') {
+                    self.in_block_comment = false;
+                    m[i] = ' ';
+                    m[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                m[i] = ' ';
+                i += 1;
+                continue;
+            }
+            if (self.template_len > 0) {
+                i = self.maskTemplate(m, i);
+                continue;
+            }
+            const c = m[i];
+            switch (c) {
+                '/' => {
+                    const next: u8 = if (i + 1 < m.len) m[i + 1] else 0;
+                    if (next == '/') {
+                        @memset(m[i..], ' ');
+                        return m;
+                    }
+                    if (next == '*') {
+                        self.in_block_comment = true;
+                        m[i] = ' ';
+                        m[i + 1] = ' ';
+                        i += 2;
+                        continue;
+                    }
+                    if (tsRegexAllowed(m, i, self.mask_prev)) {
+                        if (tsRegexEnd(m, i)) |end| {
+                            @memset(m[i + 1 .. end], ' ');
+                            i = end + 1;
+                            while (i < m.len and tsIsIdentChar(m[i])) i += 1; // flags
+                            self.mask_prev = ')'; // a regex is a value
+                            continue;
+                        }
+                    }
+                },
+                '\'', '"' => {
+                    i = tsMaskString(m, i);
+                    self.mask_prev = c;
+                    continue;
+                },
+                '`' => {
+                    self.templates[0] = null;
+                    self.template_len = 1;
+                    i += 1;
+                    i = self.maskTemplate(m, i);
+                    continue;
+                },
+                else => {},
+            }
+            if (c != ' ' and c != '\t') self.mask_prev = c;
+            i += 1;
+        }
+        return m;
+    }
+
+    /// Blank template-literal text and interpolations from `start`; returns
+    /// the index after the outermost closing backtick (kept), or `m.len`.
+    fn maskTemplate(self: *TsParseState, m: []u8, start: usize) usize {
+        var i = start;
+        while (i < m.len and self.template_len > 0) {
+            const top = &self.templates[self.template_len - 1];
+            const c = m[i];
+            if (top.*) |depth| {
+                switch (c) {
+                    '{' => top.* = depth + 1,
+                    '}' => top.* = if (depth == 0) null else depth - 1,
+                    '`' => if (self.template_len < self.templates.len) {
+                        self.templates[self.template_len] = null;
+                        self.template_len += 1;
+                    },
+                    '\'', '"' => {
+                        const end = tsMaskString(m, i);
+                        @memset(m[i..end], ' ');
+                        i = end;
+                        continue;
+                    },
+                    else => {},
+                }
+                m[i] = ' ';
+                i += 1;
+                continue;
+            }
+            if (c == '\\') {
+                m[i] = ' ';
+                if (i + 1 < m.len) m[i + 1] = ' ';
+                i += 2;
+                continue;
+            }
+            if (c == '`') {
+                self.template_len -= 1;
+                if (self.template_len == 0) {
+                    self.mask_prev = '`';
+                    return i + 1;
+                }
+                m[i] = ' ';
+                i += 1;
+                continue;
+            }
+            if (c == '$' and i + 1 < m.len and m[i + 1] == '{') {
+                top.* = 0;
+                m[i] = ' ';
+                m[i + 1] = ' ';
+                i += 2;
+                continue;
+            }
+            m[i] = ' ';
+            i += 1;
+        }
+        return @min(i, m.len);
+    }
+
+    fn countLine(self: *TsParseState, a: std.mem.Allocator, code: []const u8) !void {
+        for (code, 0..) |c, i| {
+            switch (c) {
+                '(' => self.paren_depth += 1,
+                ')' => self.paren_depth -|= 1,
+                '{' => {
+                    const kind = self.braceKind(i + 1 == code.len);
+                    try self.scopes.append(a, .{ .kind = kind, .paren_base = self.paren_depth });
+                },
+                '}' => if (self.scopes.pop()) |s| {
+                    self.paren_depth = s.paren_base;
+                },
+                ';' => if (self.head != null and self.paren_depth == self.head_paren) {
+                    self.head = null;
+                },
+                else => {},
+            }
+            if (c != ' ' and c != '\t') {
+                self.prev_sig2 = self.prev_sig;
+                self.prev_sig = c;
+            }
+        }
+        if (self.head != null) {
+            if (self.head_lines_left == 0) self.head = null else self.head_lines_left -= 1;
+        }
+    }
+
+    fn braceKind(self: *TsParseState, last_on_line: bool) TsScopeKind {
+        if (self.head) |h| {
+            if (self.paren_depth == self.head_paren) {
+                self.head = null;
+                // A class body brace ends its head line; an earlier brace is
+                // a one-line `class A {}` or a type argument.
+                return if (h == .type_body or last_on_line) h else .other;
+            }
+        }
+        const top: ?TsScope = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1] else null;
+        if (top) |t| if (t.kind == .type_body) return .type_body;
+        switch (self.prev_sig) {
+            // `x: {` is a type annotation, except as an object property's
+            // value (`a: {` directly in an object literal).
+            ':' => {
+                const t = top orelse return .type_body;
+                if (t.kind == .class_body or self.paren_depth > t.paren_base) return .type_body;
+            },
+            '<' => return .type_body,
+            '|' => if (self.prev_sig2 != '|') return .type_body,
+            '&' => if (self.prev_sig2 != '&') return .type_body,
+            else => {},
+        }
+        return .other;
+    }
+
+    /// Apply expression-body ends, then drop or revert the new callables that
+    /// sit inside another function or method body. Runs after computeSymbolEnds.
+    fn finish(self: *TsParseState, a: std.mem.Allocator, outline: *FileOutline) !void {
+        const syms = outline.symbols.items;
+        for (self.fixed_ends.items) |f| {
+            if (f.index < syms.len) syms[f.index].line_end = @max(syms[f.index].line_start, f.line_end);
+        }
+        if (self.new_symbols.items.len == 0) return;
+        std.mem.sort(TsNewSymbol, self.new_symbols.items, {}, struct {
+            fn lt(_: void, x: TsNewSymbol, y: TsNewSymbol) bool {
+                return x.index < y.index;
+            }
+        }.lt);
+        std.mem.sort(usize, self.not_bodies.items, {}, std.sort.asc(usize));
+
+        var ni: usize = 0;
+        var bi: usize = 0;
+        var enc_end: u32 = 0;
+        var dropped = false;
+        for (syms, 0..) |*sym, si| {
+            while (ni < self.new_symbols.items.len and self.new_symbols.items[ni].index < si) ni += 1;
+            while (bi < self.not_bodies.items.len and self.not_bodies.items[bi] < si) bi += 1;
+            if (sym.kind != .function and sym.kind != .method) continue;
+            const new = ni < self.new_symbols.items.len and self.new_symbols.items[ni].index == si;
+            if (new and sym.line_start <= enc_end) {
+                if (self.new_symbols.items[ni].fallback) |fb| {
+                    sym.kind = fb;
+                    switch (fb) {
+                        .import, .variable, .constant, .comment_block, .type_alias, .macro_def => sym.line_end = sym.line_start,
+                        else => {},
+                    }
+                } else {
+                    sym.line_start = 0; // dropped below
+                    dropped = true;
+                }
+                continue;
+            }
+            const not_body = bi < self.not_bodies.items.len and self.not_bodies.items[bi] == si;
+            if (!not_body) enc_end = @max(enc_end, sym.line_end);
+        }
+        if (!dropped) return;
+        var w: usize = 0;
+        for (outline.symbols.items) |sym| {
+            if (sym.line_start == 0) {
+                a.free(sym.name);
+                if (sym.detail) |d| a.free(d);
+                continue;
+            }
+            outline.symbols.items[w] = sym;
+            w += 1;
+        }
+        outline.symbols.shrinkRetainingCapacity(w);
+    }
+};
+
+fn tsIsIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_' or c >= 0x80;
+}
+
+fn tsIsIdentChar(c: u8) bool {
+    return tsIsIdentStart(c) or std.ascii.isDigit(c);
+}
+
+fn tsSkipWs(s: []const u8, i: usize) usize {
+    var j = i;
+    while (j < s.len and (s[j] == ' ' or s[j] == '\t')) j += 1;
+    return j;
+}
+
+fn tsIdentEnd(s: []const u8, i: usize) usize {
+    if (i >= s.len or !tsIsIdentStart(s[i])) return i;
+    var j = i + 1;
+    while (j < s.len and tsIsIdentChar(s[j])) j += 1;
+    return j;
+}
+
+/// The index past `word` when it starts at `i` as a whole word.
+fn tsWordAt(s: []const u8, i: usize, word: []const u8) ?usize {
+    if (i > s.len or !std.mem.startsWith(u8, s[i..], word)) return null;
+    const e = i + word.len;
+    if (e < s.len and tsIsIdentChar(s[e])) return null;
+    return e;
+}
+
+/// Index past the `>` matching the `<` at `i`.
+fn tsSkipAngles(s: []const u8, i: usize) ?usize {
+    var depth: u32 = 0;
+    var j = i;
+    while (j < s.len) : (j += 1) {
+        switch (s[j]) {
+            '<' => depth += 1,
+            '>' => {
+                if (j > 0 and s[j - 1] == '=') continue; // `=>` in a function type
+                depth -|= 1;
+                if (depth == 0) return j + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Blank a '...' or "..." string's contents (it ends at the line end at the
+/// latest); returns the index past it.
+fn tsMaskString(m: []u8, start: usize) usize {
+    const q = m[start];
+    var j = start + 1;
+    while (j < m.len and m[j] != q) : (j += 1) {
+        if (m[j] == '\\' and j + 1 < m.len) {
+            m[j] = ' ';
+            j += 1;
+        }
+        m[j] = ' ';
+    }
+    return if (j < m.len) j + 1 else m.len;
+}
+
+fn tsRegexAllowed(m: []const u8, i: usize, prev: u8) bool {
+    if (Explorer.isRegexStart(prev)) return true;
+    if (!tsIsIdentChar(prev)) return false;
+    // `return /re/`: an identifier char before the slash is division unless
+    // it ends a keyword.
+    var e = i;
+    while (e > 0 and (m[e - 1] == ' ' or m[e - 1] == '\t')) e -= 1;
+    var s = e;
+    while (s > 0 and tsIsIdentChar(m[s - 1])) s -= 1;
+    const word = m[s..e];
+    const kws = [_][]const u8{ "return", "typeof", "case", "do", "else", "in", "of", "void", "yield", "await", "throw", "delete", "instanceof", "new" };
+    for (kws) |kw| if (std.mem.eql(u8, word, kw)) return true;
+    return false;
+}
+
+/// Index of the slash closing the regex literal opened at `start`, if on this line.
+fn tsRegexEnd(m: []const u8, start: usize) ?usize {
+    var in_class = false;
+    var j = start + 1;
+    while (j < m.len) : (j += 1) {
+        switch (m[j]) {
+            '\\' => j += 1,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' => if (!in_class) return j,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Index past leading `@decorator` / `@a.b(args)` tokens.
+fn tsSkipDecorators(s: []const u8, start: usize) usize {
+    var i = tsSkipWs(s, start);
+    while (i < s.len and s[i] == '@') {
+        i += 1;
+        while (i < s.len and (tsIsIdentChar(s[i]) or s[i] == '.')) i += 1;
+        if (i < s.len and s[i] == '(') {
+            var depth: u32 = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '(') {
+                    depth += 1;
+                } else if (s[i] == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        i = tsSkipWs(s, i);
+    }
+    return i;
+}
+
+/// Index past any of `mods` that are followed by more of the member.
+fn tsSkipModifiers(s: []const u8, start: usize, mods: []const []const u8) usize {
+    var i = start;
+    outer: while (true) {
+        for (mods) |m| {
+            const e = tsWordAt(s, i, m) orelse continue;
+            const j = tsSkipWs(s, e);
+            if (j > e and j < s.len and (tsIsIdentStart(s[j]) or s[j] == '#' or s[j] == '*' or s[j] == '[' or s[j] == '"' or s[j] == '\'')) {
+                i = j;
+                continue :outer;
+            }
+        }
+        return i;
+    }
+}
+
+/// Index of the top-level assignment `=` at or after `start` (not `=>`,
+/// `==`, `<=`, `>=`, `!=`), stopping at `;` or `,`.
+fn tsAssignIndex(s: []const u8, start: usize) ?usize {
+    var nest: u32 = 0;
+    var j = start;
+    while (j < s.len) : (j += 1) {
+        switch (s[j]) {
+            '(', '[', '{', '<' => nest += 1,
+            ')', ']', '}' => {
+                if (nest == 0) return null;
+                nest -= 1;
+            },
+            '>' => nest -|= 1,
+            '=' => {
+                const next: u8 = if (j + 1 < s.len) s[j + 1] else 0;
+                if (next == '>' or next == '=') {
+                    j += 1;
+                    continue;
+                }
+                const prev: u8 = if (j > 0) s[j - 1] else 0;
+                if (prev == '!' or prev == '<' or prev == '>' or prev == '=') continue;
+                if (nest == 0) return j;
+            },
+            ';', ',' => if (nest == 0) return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Whether the value at `start` is a function: an arrow (`(`, `async (`,
+/// `<T>(`, `x =>`) or a function expression (`function`, `async function*`).
+/// Sets `out.mode`/`pos`/`single_param`.
+fn tsFunctionValue(s: []const u8, start: usize, out: *TsCandidate) bool {
+    var i = tsSkipWs(s, start);
+    if (tsWordAt(s, i, "async")) |e| {
+        const j = tsSkipWs(s, e);
+        if (j < s.len and (s[j] == '(' or (j > e and (s[j] == '<' or tsIsIdentStart(s[j]))))) i = j;
+    }
+    if (tsWordAt(s, i, "function")) |e| {
+        var j = tsSkipWs(s, e);
+        if (j < s.len and s[j] == '*') j = tsSkipWs(s, j + 1);
+        j = tsSkipWs(s, tsIdentEnd(s, j));
+        if (j < s.len and s[j] == '<') j = tsSkipWs(s, tsSkipAngles(s, j) orelse return false);
+        if (j >= s.len or s[j] != '(') return false;
+        out.mode = .method;
+        out.pos = j;
+        return true;
+    }
+    if (i < s.len and s[i] == '<') i = tsSkipWs(s, tsSkipAngles(s, i) orelse return false);
+    if (i < s.len and s[i] == '(') {
+        out.mode = .arrow;
+        out.pos = i;
+        return true;
+    }
+    const id_end = tsIdentEnd(s, i);
+    if (id_end > i) {
+        const j = tsSkipWs(s, id_end);
+        if (j + 1 < s.len and s[j] == '=' and s[j + 1] == '>') {
+            out.mode = .arrow;
+            out.pos = j + 2;
+            out.single_param = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Words that start a statement or expression, never an object member.
+fn tsIsReservedWord(name: []const u8) bool {
+    const words = [_][]const u8{
+        "if",       "else",       "for",        "while",     "do",        "switch",   "case",
+        "default",  "catch",      "try",        "finally",   "with",      "function", "return",
+        "throw",    "new",        "delete",     "typeof",    "void",      "await",    "yield",
+        "in",       "of",         "instanceof", "super",     "this",      "import",   "export",
+        "const",    "let",        "var",        "class",     "interface", "type",     "enum",
+        "extends",  "implements", "declare",    "namespace", "module",    "break",    "continue",
+        "debugger",
+    };
+    for (words) |w| if (std.mem.eql(u8, name, w)) return true;
+    return false;
+}
+
+/// After a member's modifiers: `name(`, `name = <function>`, `name: T = <function>`
+/// (class field) or `name: <function>` (object property).
+fn tsMemberAfterModifiers(code: []const u8, start: usize, object_ctx: bool) ?TsCandidate {
+    var i = start;
+    if (i < code.len and code[i] == '*') i = tsSkipWs(code, i + 1);
+    // `#name`: calls read `this.#name(` as `name`, so the node drops the `#`.
+    if (!object_ctx and i < code.len and code[i] == '#') i += 1;
+    const name_end = tsIdentEnd(code, i);
+    if (name_end == i) return null;
+    if (object_ctx and tsIsReservedWord(code[i..name_end])) return null;
+    var c: TsCandidate = .{ .name_start = i, .name_end = name_end, .decl = false };
+    var j = tsSkipWs(code, name_end);
+    if (j < code.len and (code[j] == '?' or code[j] == '!')) j = tsSkipWs(code, j + 1);
+    if (j < code.len and code[j] == '<') j = tsSkipWs(code, tsSkipAngles(code, j) orelse return null);
+    if (j >= code.len) return null;
+    switch (code[j]) {
+        '(' => {
+            c.pos = j;
+            return c;
+        },
+        '=' => {
+            if (object_ctx) return null;
+            if (j + 1 < code.len and (code[j + 1] == '>' or code[j + 1] == '=')) return null;
+            return if (tsFunctionValue(code, j + 1, &c)) c else null;
+        },
+        ':' => {
+            const value = if (object_ctx) j + 1 else (tsAssignIndex(code, j + 1) orelse return null) + 1;
+            return if (tsFunctionValue(code, value, &c)) c else null;
+        },
+        else => return null,
+    }
+}
+
+const ts_class_modifiers = [_][]const u8{ "public", "private", "protected", "static", "readonly", "override", "abstract", "declare", "accessor", "async", "get", "set" };
+const ts_object_modifiers = [_][]const u8{ "async", "get", "set" };
+
+fn tsClassMember(code: []const u8) ?TsCandidate {
+    const i = tsSkipModifiers(code, tsSkipDecorators(code, 0), &ts_class_modifiers);
+    return tsMemberAfterModifiers(code, i, false);
+}
+
+fn tsObjectMember(code: []const u8) ?TsCandidate {
+    const i = tsSkipModifiers(code, 0, &ts_object_modifiers);
+    return tsMemberAfterModifiers(code, i, true);
+}
+
+/// `[export] const|let|var name[: T] = <arrow>`. Function expressions are
+/// left to the keyword sniff, which already records them as `.function`.
+fn tsConstDecl(code: []const u8) ?TsCandidate {
+    var i: usize = 0;
+    if (tsWordAt(code, i, "export")) |e| i = tsSkipWs(code, e);
+    const kw_end = tsWordAt(code, i, "const") orelse tsWordAt(code, i, "let") orelse tsWordAt(code, i, "var") orelse return null;
+    i = tsSkipWs(code, kw_end);
+    if (i == kw_end or tsWordAt(code, i, "enum") != null) return null;
+    const name_end = tsIdentEnd(code, i);
+    if (name_end == i) return null;
+    var c: TsCandidate = .{ .name_start = i, .name_end = name_end, .decl = true };
+    var j = tsSkipWs(code, name_end);
+    if (j < code.len and code[j] == '!') j = tsSkipWs(code, j + 1);
+    if (j >= code.len) return null;
+    const eq = switch (code[j]) {
+        ':' => tsAssignIndex(code, j + 1) orelse return null,
+        '=' => j,
+        else => return null,
+    };
+    if (eq + 1 < code.len and (code[eq + 1] == '>' or code[eq + 1] == '=')) return null;
+    if (!tsFunctionValue(code, eq + 1, &c) or c.mode != .arrow) return null;
+    return c;
+}
+
+/// The scope a `class`/`interface`/`enum`/`type`/`declare module` head opens.
+fn tsHeadKind(code: []const u8) ?TsScopeKind {
+    var i = tsSkipDecorators(code, 0);
+    var declared = false;
+    while (true) {
+        const e = tsWordAt(code, i, "export") orelse tsWordAt(code, i, "default") orelse tsWordAt(code, i, "abstract") orelse blk: {
+            const d = tsWordAt(code, i, "declare") orelse break;
+            declared = true;
+            break :blk d;
+        };
+        i = tsSkipWs(code, e);
+    }
+    if (tsWordAt(code, i, "class") != null) return .class_body;
+    if (tsWordAt(code, i, "interface") != null or tsWordAt(code, i, "enum") != null) return .type_body;
+    if (tsWordAt(code, i, "const")) |e| {
+        if (tsWordAt(code, tsSkipWs(code, e), "enum") != null) return .type_body;
+    }
+    if (tsWordAt(code, i, "type")) |e| {
+        const j = tsSkipWs(code, e);
+        if (j > e and j < code.len and tsIsIdentStart(code[j])) return .type_body;
+    }
+    if (declared and (tsWordAt(code, i, "module") != null or tsWordAt(code, i, "global") != null or tsWordAt(code, i, "namespace") != null)) return .type_body;
+    // Class expressions: `= class {`, `(class extends X {`, `return class {`.
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, code, from, "class")) |p| : (from = p + 5) {
+        if (tsWordAt(code, p, "class") == null or (p > 0 and tsIsIdentChar(code[p - 1]))) continue;
+        var b = p;
+        while (b > 0 and (code[b - 1] == ' ' or code[b - 1] == '\t')) b -= 1;
+        if (b == 0) continue;
+        const before = code[b - 1];
+        if (before == '=' or before == '(' or before == ',' or before == ':' or std.mem.endsWith(u8, code[0..b], "return")) return .class_body;
+    }
+    return null;
+}
+
+/// Feed a parameter list (and what follows it) from `start`.
+fn tsSigFeed(sig: *TsSig, code: []const u8, start: usize) TsSigOutcome {
+    var i = start;
+    while (i < code.len) : (i += 1) {
+        const c = code[i];
+        switch (sig.phase) {
+            .params => switch (c) {
+                '(' => sig.depth += 1,
+                ')' => {
+                    sig.depth -|= 1;
+                    if (sig.depth == 0) sig.phase = .after;
+                },
+                else => {},
+            },
+            .after => {
+                if (c == ' ' or c == '\t') continue;
+                if (c == ':') {
+                    sig.phase = .ret_type;
+                    sig.nest = 0;
+                    continue;
+                }
+                return switch (sig.mode) {
+                    .method => if (c == '{') .block else .rejected,
+                    .arrow => if (c == '=' and i + 1 < code.len and code[i + 1] == '>') tsArrowBody(code, i + 2) else .rejected,
+                };
+            },
+            .ret_type => switch (c) {
+                '(', '[', '<' => sig.nest += 1,
+                ')', ']', '}' => {
+                    if (sig.nest == 0) return .rejected;
+                    sig.nest -= 1;
+                },
+                '{' => {
+                    if (sig.nest == 0 and sig.mode == .method) return .block;
+                    sig.nest += 1;
+                },
+                '>' => {
+                    if (i > 0 and code[i - 1] == '=') {
+                        if (sig.nest == 0 and sig.mode == .arrow) return tsArrowBody(code, i + 1);
+                    } else sig.nest -|= 1;
+                },
+                ';', ',' => if (sig.nest == 0) return .rejected,
+                '=' => if (sig.nest == 0 and !(i + 1 < code.len and code[i + 1] == '>')) return .rejected,
+                else => {},
+            },
+        }
+    }
+    return .pending;
+}
+
+/// What follows an arrow's `=>` at `pos`.
+fn tsArrowBody(code: []const u8, pos: usize) TsSigOutcome {
+    const i = tsSkipWs(code, pos);
+    if (i < code.len and code[i] == '{') return .block;
+    return .{ .expr = i };
+}
+
+/// Feed an expression body from `start`; true once it has ended on this line.
+fn tsExprFeed(e: *TsExprEnd, code: []const u8, start: usize) bool {
+    var i = start;
+    while (i < code.len) : (i += 1) {
+        switch (code[i]) {
+            '(', '[', '{' => {
+                e.depth += 1;
+                e.started = true;
+            },
+            ')', ']', '}' => {
+                e.depth -= 1;
+                if (e.depth < 0) return true;
+            },
+            ';', ',' => if (e.depth == 0 and e.started) return true,
+            ' ', '\t' => {},
+            else => e.started = true,
+        }
+    }
+    return e.started and e.depth == 0;
 }
 
 /// Extract the module path from a Python import line.
