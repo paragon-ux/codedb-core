@@ -52,10 +52,24 @@ note for `.codedbrc` users.
 
 ### Release process
 
-1. On each platform, run `node scripts/build-all.mjs` to drop the matching
-   binary into `dist/`.
-2. Collect all five `dist/` binaries into one tree.
-3. `npm run changeset` (or a manual changeset), then `npm publish`.
+Releases go out from CI via npm Trusted Publishing
+([`.github/workflows/release.yml`](./.github/workflows/release.yml)):
 
-The `prepack` hook rebuilds the current platform's binary before packing, so a
-local `npm pack` always ships a self-consistent binary for the host.
+1. Bump `version` in `package.json` and add the `CHANGELOG.md` entry; commit.
+2. Push a matching tag: `git tag v<version> && git push origin v<version>`.
+3. The workflow runs `zig build test`, builds all five binaries (linux and
+   win32 on Ubuntu, darwin on macOS), checks the tag matches `package.json`,
+   packs with the binaries marked executable, and runs
+   `npm publish --access public --provenance --ignore-scripts`. It skips the
+   publish if that version is already on npm, and attaches the tarball to a
+   GitHub Release.
+
+To rehearse without publishing, run it by hand (`dry_run` defaults to true):
+
+```sh
+gh workflow run release.yml --ref main -f dry_run=true
+```
+
+Avoid publishing from a local checkout: `prepack` rebuilds only the host's
+binary, and a Windows host can't set the exec bit on the darwin/linux
+binaries.

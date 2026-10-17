@@ -1,0 +1,201 @@
+name: release
+
+# Builds all five prebuilt binaries and publishes @paragon-ux/codedb-core via
+# npm Trusted Publishing (OIDC, no token).
+#   - push of a v* tag: test, build, check the tag matches package.json, and
+#     publish unless that version is already on npm.
+#   - workflow_dispatch: same pipeline; with dry_run (the default) it packs and
+#     runs `npm publish --dry-run` and never publishes.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and run npm publish --dry-run only (never publish)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: zig build test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Test
+        run: zig build test --summary all
+
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        # `name` must match the BINARIES table in dist/index.js.
+        include:
+          - { os: ubuntu-latest, target: x86_64-linux, out: codedb, name: codedb-linux-x64, smoke: true }
+          - { os: ubuntu-latest, target: aarch64-linux, out: codedb, name: codedb-linux-arm64, smoke: false }
+          - { os: ubuntu-latest, target: x86_64-windows, out: codedb.exe, name: codedb-win32-x64.exe, smoke: false }
+          - { os: macos-latest, target: aarch64-macos, out: codedb, name: codedb-darwin-arm64, smoke: true }
+          - { os: macos-latest, target: x86_64-macos, out: codedb, name: codedb-darwin-x64, smoke: false }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp "zig-out/bin/${{ matrix.out }}" "${{ matrix.name }}"
+
+      - name: Smoke-run native binary
+        if: matrix.smoke
+        run: |
+          chmod +x "${{ matrix.name }}"
+          "./${{ matrix.name }}" --version
+          "./${{ matrix.name }}" . outline src/state_paths.zig
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          if-no-files-found: error
+
+  publish:
+    name: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && 'publish (dry run)' || 'publish' }}
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub Release on tag runs
+      id-token: write # npm Trusted Publishing + provenance
+    env:
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: |
+          npm install --global 'npm@^11.5.1'
+          node --version
+          npm --version
+
+      - name: Download binaries into dist/
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: codedb-*
+          merge-multiple: true
+
+      - name: Require every binary dist/index.js expects
+        run: |
+          mapfile -t expected < <(node -e '
+            const src = require("fs").readFileSync("dist/index.js", "utf8");
+            for (const m of src.matchAll(/"(codedb-[^"]+)"/g)) console.log(m[1]);
+          ')
+          if [ "${#expected[@]}" -ne 5 ]; then
+            echo "::error::expected 5 binaries in dist/index.js, found ${#expected[@]}: ${expected[*]}"
+            exit 1
+          fi
+          for f in "${expected[@]}"; do
+            if [ ! -s "dist/$f" ]; then
+              echo "::error::missing dist/$f"
+              exit 1
+            fi
+          done
+          # Artifacts drop the exec bit; npm keeps it when packing on Linux.
+          chmod 0755 bin/codedb dist/codedb-*
+          ls -l bin dist
+
+      - name: Resolve package version
+        id: meta
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            if [ "${GITHUB_REF_NAME#v}" != "${version}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+              exit 1
+            fi
+          fi
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "${name}@${version} is already on npm"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack and check the tarball
+        id: pack
+        run: |
+          tarball="$(npm pack --ignore-scripts | tail -n 1)"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          tar -tvzf "${tarball}" | tee listing.txt
+          for f in bin/codedb dist/codedb-linux-x64 dist/codedb-linux-arm64 dist/codedb-darwin-arm64 dist/codedb-darwin-x64; do
+            if ! grep -Eq "^-rwxr-xr-x .* package/${f}\$" listing.txt; then
+              echo "::error::package/${f} is missing or not executable in ${tarball}"
+              exit 1
+            fi
+          done
+          grep -Eq " package/dist/codedb-win32-x64\.exe\$" listing.txt
+
+      - name: npm publish --dry-run
+        if: env.DRY_RUN == 'true'
+        run: |
+          tag_args=()
+          if [ "${{ steps.meta.outputs.published }}" = "true" ]; then
+            # npm refuses even a dry run over a published version, so rehearse
+            # with a throwaway prerelease of this checkout (never committed).
+            npm version --no-git-tag-version "${{ steps.meta.outputs.version }}-dryrun.${GITHUB_RUN_ID}"
+            tag_args=(--tag dryrun)
+          fi
+          npm publish --dry-run --access public --ignore-scripts "${tag_args[@]}"
+
+      - name: Publish to npm
+        if: env.DRY_RUN != 'true' && steps.meta.outputs.published == 'false'
+        run: npm publish --access public --provenance --ignore-scripts
+
+      - name: Skip publish (version already on npm)
+        if: env.DRY_RUN != 'true' && steps.meta.outputs.published == 'true'
+        run: echo "::notice::${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is already on npm; nothing published."
+
+      - name: Create or update GitHub Release with the tarball
+        if: env.DRY_RUN != 'true' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${{ steps.pack.outputs.tarball }}" --clobber
+          else
+            gh release create "${tag}" "${{ steps.pack.outputs.tarball }}" --verify-tag --generate-notes
+          fi
