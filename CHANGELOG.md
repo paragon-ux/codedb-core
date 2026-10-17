@@ -1,6 +1,8 @@
 # @paragon-ux/codedb-core
 
-## Unreleased
+## 2.0.0
+
+**Breaking:** the config file is now `.codedb-corerc`, and `.codedbrc` is no longer read automatically. If you tuned `.codedbrc`, rename it or pass `--config-file .codedbrc`. Queries and output are unchanged.
 
 ### Own on-disk names; never touch upstream codedb's state
 
