@@ -1,5 +1,15 @@
 # @paragon-ux/codedb-core
 
+## [Unreleased]
+
+- **A name prefers its one definition outside test files.** Since 2.1.0, object-literal functions are call-graph nodes, so test mocks such as `queryCapnMemory: async () => {…}` passed to the code under test share the real function's name. `callers`, `callees`, and `neighbors` then reported `queryCapnMemory` as ambiguous, with the real function and nine mocks as candidates.
+  - A bare or qualified name that matches several definitions now resolves to the one outside test files. A file counts as a test file under the same rule edge resolution uses. Edge resolution already never resolves a call to a test-file definition.
+  - Several non-test definitions are still ambiguous, and the response still lists every candidate, test ones included. A name whose definitions are all in test files is ambiguous as before. Ambiguous names still emit no edge.
+  - A name that resolves to one node is never reported as ambiguous, even when it has no callers or callees.
+  - `symbol` is unchanged: it lists definitions and doesn't resolve a name.
+  - In the library, `CallGraph.lookup` does the resolution, and `StepsWithStats.resolved` reports whether `callersOfWithStats`/`calleesOfWithStats` resolved the name.
+- **Tests**: `src/ts_callgraph_test.zig` covers a src function with same-named test mocks, two src definitions with a mock, and mocks only. `src/neighbors_json_test.zig` checks the CLI JSON for a resolved name with and without neighbors.
+
 ## 2.1.0
 
 - **TypeScript and JavaScript callers inside class methods, object-literal functions, and arrow consts.** Only `.function` and `.method` symbols are call-graph nodes. The TS/JS outline produced no symbol for class methods (`async start() {`) or function-valued object properties (`handler: async (args) => {`), and recorded arrow-function consts as `.constant`, so `callers`, `callees`, and `neighbors` had no caller for the calls inside them. These are now nodes:

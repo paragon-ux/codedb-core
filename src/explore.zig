@@ -747,6 +747,32 @@ pub const CallGraph = struct {
         const names = if (std.mem.indexOfScalar(u8, name, '.') != null) self.node_qualified else self.node_name;
         return std.mem.eql(u8, names[i], name);
     }
+
+    pub const Lookup = union(enum) { none, ambiguous, node: codegraph.NodeId };
+
+    /// The node a callers/callees/neighbors name resolves to. A name that
+    /// matches several nodes resolves to its one node outside test files,
+    /// the preference edge resolution applies to callees. Several non-test
+    /// nodes, or several nodes all in test files, are ambiguous.
+    pub fn lookup(self: *const CallGraph, name: []const u8) Lookup {
+        var matches: usize = 0;
+        var last: codegraph.NodeId = 0;
+        var non_test: usize = 0;
+        var last_non_test: codegraph.NodeId = 0;
+        for (0..self.node_name.len) |i| {
+            if (!self.nodeMatches(i, name)) continue;
+            matches += 1;
+            last = @intCast(i);
+            if (!Explorer.isLikelyTestPath(self.node_path[i])) {
+                non_test += 1;
+                last_non_test = @intCast(i);
+            }
+        }
+        if (matches == 0) return .none;
+        if (matches == 1) return .{ .node = last };
+        if (non_test == 1) return .{ .node = last_non_test };
+        return .ambiguous;
+    }
 };
 
 pub const CallPathStep = struct {
@@ -5432,6 +5458,8 @@ pub const Explorer = struct {
         steps: []CallPathStep,
         dropped_callers: u32,
         dropped_callees: u32,
+        /// The name resolved to one node; `steps` may still be empty.
+        resolved: bool = false,
     };
 
     pub const NeighborResult = struct {
@@ -5446,7 +5474,8 @@ pub const Explorer = struct {
 
     /// Resolved callers of a symbol name — every function/method that calls it.
     /// Fail-closed: returns empty when the name is missing or ambiguous (>1
-    /// definition), so a bare-name collision never merges unrelated functions.
+    /// definition once a single non-test one is preferred; see CallGraph.lookup),
+    /// so a bare-name collision never merges unrelated functions.
     pub fn callersOf(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, max: usize) ![]CallPathStep {
         const res = try self.neighborsOfWithStats(name, allocator, max, true);
         return res.steps;
@@ -5475,16 +5504,11 @@ pub const Explorer = struct {
         self.ensureCallGraph(allocator);
         const cg = self.call_graph orelse return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 };
 
-        var target: ?codegraph.NodeId = null;
-        var matches: usize = 0;
-        for (0..cg.node_name.len) |i| {
-            if (cg.nodeMatches(i, name)) {
-                matches += 1;
-                if (matches > 1) return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 }; // ambiguous — fail closed
-                target = @intCast(i);
-            }
-        }
-        const id = target orelse return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 };
+        const id = switch (cg.lookup(name)) {
+            .node => |n| n,
+            // missing or ambiguous — fail closed
+            .none, .ambiguous => return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 },
+        };
 
         const adj = if (reverse) cg.radj else cg.adj;
         var steps: std.ArrayList(CallPathStep) = .empty;
@@ -5497,6 +5521,7 @@ pub const Explorer = struct {
             .steps = try steps.toOwnedSlice(allocator),
             .dropped_callers = cg.node_dropped_ambiguous_callers[id],
             .dropped_callees = cg.node_dropped_ambiguous_callees[id],
+            .resolved = true,
         };
     }
 
@@ -5576,20 +5601,11 @@ pub const Explorer = struct {
         self.ensureCallGraph(allocator);
         const cg = self.call_graph;
 
-        var target: ?codegraph.NodeId = null;
-        var matches: usize = 0;
-        if (cg) |graph| {
-            for (0..graph.node_name.len) |i| {
-                if (graph.nodeMatches(i, name)) {
-                    matches += 1;
-                    target = @intCast(i);
-                }
-            }
-        }
+        const found: CallGraph.Lookup = if (cg) |graph| graph.lookup(name) else .none;
 
-        if (matches == 1 and cg != null) {
+        if (found == .node) {
             const graph = cg.?;
-            const id = target.?;
+            const id = found.node;
             var callers_list: std.ArrayList(CallPathStep) = .empty;
             errdefer callers_list.deinit(allocator);
             for (graph.radj[id].items) |nid| {
@@ -5621,7 +5637,7 @@ pub const Explorer = struct {
 
         self.mu.unlockShared();
 
-        // matches != 1: either ambiguous or missing from the call graph.
+        // Either ambiguous or missing from the call graph.
         // Look the definitions up to tell candidates from a complete miss.
         const cands = try self.neighborCandidates(name, allocator);
         var callable_count: usize = 0;
@@ -5629,7 +5645,7 @@ pub const Explorer = struct {
             if (r.symbol.kind == .function or r.symbol.kind == .method) callable_count += 1;
         }
 
-        if (callable_count > 1 or matches > 1) {
+        if (callable_count > 1 or found == .ambiguous) {
             return .{
                 .callers = &.{},
                 .callees = &.{},

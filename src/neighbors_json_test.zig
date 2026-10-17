@@ -19,6 +19,28 @@ const svc_ts =
     \\
 ;
 
+const lone_ts =
+    \\export function lone(): number {
+    \\  return 1;
+    \\}
+    \\export function useLone(): number {
+    \\  return lone();
+    \\}
+    \\
+;
+
+/// Mocks named like `lone`, in an object passed from a test callback.
+const lone_mock_ts =
+    \\test("mocks", () => {
+    \\  useLone({
+    \\    lone: () => {
+    \\      return 2;
+    \\    },
+    \\  });
+    \\});
+    \\
+;
+
 const shapes_ts =
     \\export class Shapes {
     \\  get size(): number {
@@ -66,6 +88,9 @@ test "call-graph JSON: nodes carry kind and qualified, and qualified names resol
     try tmp.dir.createDirPath(io, "proj/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "proj/src/svc.ts", .data = svc_ts });
     try tmp.dir.writeFile(io, .{ .sub_path = "proj/src/shapes.ts", .data = shapes_ts });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/src/lone.ts", .data = lone_ts });
+    try tmp.dir.createDirPath(io, "proj/test");
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/test/lone.test.ts", .data = lone_mock_ts });
     const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.codedb_exe, arena);
     const proj = try tmp.dir.realPathFileAlloc(io, "proj", arena);
 
@@ -99,6 +124,16 @@ test "call-graph JSON: nodes carry kind and qualified, and qualified names resol
 
     const missing = try runJson(arena, exe, proj, &.{ "neighbors", "Shapes.area" });
     try expectContains(missing, "\"symbol_exists\":false,\"ambiguous\":false");
+
+    // A test-file mock doesn't make the src definition ambiguous, even
+    // where it has no neighbors to list.
+    const lone_callers = try runJson(arena, exe, proj, &.{ "callers", "lone" });
+    try expectContains(lone_callers, "\"ambiguous\":false,\"count\":1,");
+    try expectContains(lone_callers, "\"name\":\"useLone\"");
+    const lone_callees = try runJson(arena, exe, proj, &.{ "callees", "lone" });
+    try expectContains(lone_callees, "\"ambiguous\":false,\"count\":0,");
+    const lone_neighbors = try runJson(arena, exe, proj, &.{ "neighbors", "lone" });
+    try expectContains(lone_neighbors, "\"symbol_exists\":true,\"ambiguous\":false");
 
     // `symbol` results carry the qualified name as well.
     const sym = try runJson(arena, exe, proj, &.{ "symbol", "start" });

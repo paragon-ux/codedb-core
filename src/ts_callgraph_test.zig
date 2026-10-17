@@ -255,6 +255,117 @@ test "ts call graph: an ambiguous qualified name lists every candidate and emits
     try testing.expectEqual(@as(usize, 0), missing.candidates.len);
 }
 
+const capn_ts =
+    \\export async function queryMemory(q: string): Promise<string> {
+    \\  return q;
+    \\}
+    \\export async function route(deps: unknown): Promise<string> {
+    \\  return queryMemory("x");
+    \\}
+    \\
+;
+
+/// Mock methods named like the src function, in objects passed to the code
+/// under test from anonymous test callbacks.
+const capn_mock_ts =
+    \\import { route } from "../src/capn";
+    \\test("misses", async () => {
+    \\  await route({
+    \\    queryMemory: async () => {
+    \\      return "miss";
+    \\    },
+    \\  });
+    \\});
+    \\test("hits", async () => {
+    \\  await route({
+    \\    queryMemory: async () => {
+    \\      return "hit";
+    \\    },
+    \\  });
+    \\});
+    \\
+;
+
+fn countNodesNamed(ex: *Explorer, name: []const u8) !usize {
+    const steps = try ex.callersOf("__build_graph__", testing.allocator, 1);
+    testing.allocator.free(steps);
+    const cg = ex.call_graph.?;
+    var n: usize = 0;
+    for (cg.node_name) |nm| {
+        if (std.mem.eql(u8, nm, name)) n += 1;
+    }
+    return n;
+}
+
+test "call graph lookup: a name resolves to its one definition outside test files" {
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    try ex.indexFile("src/capn.ts", capn_ts);
+    try ex.indexFile("test/capn.test.ts", capn_mock_ts);
+    // The two mocks are nodes too, so the name matches three.
+    try testing.expectEqual(@as(usize, 3), try countNodesNamed(&ex, "queryMemory"));
+
+    const callers = try ex.callersOfWithStats("queryMemory", testing.allocator, 50);
+    defer freeSteps(callers.steps);
+    try testing.expect(callers.resolved);
+    try testing.expectEqual(@as(usize, 1), callers.steps.len);
+    try testing.expectEqualStrings("route", callers.steps[0].name);
+
+    // Resolved with no callees is still resolved, not ambiguous.
+    const callees = try ex.calleesOfWithStats("queryMemory", testing.allocator, 50);
+    defer freeSteps(callees.steps);
+    try testing.expect(callees.resolved);
+    try testing.expectEqual(@as(usize, 0), callees.steps.len);
+
+    const both = try ex.bothNeighborsOf("queryMemory", testing.allocator, 50);
+    defer {
+        freeSteps(both.callers);
+        freeSteps(both.callees);
+        freeCandidates(both.candidates);
+    }
+    try testing.expect(both.symbol_exists and !both.ambiguous);
+    try testing.expectEqual(@as(usize, 1), both.callers.len);
+    try testing.expectEqualStrings("route", both.callers[0].name);
+}
+
+test "call graph lookup: several non-test definitions, or only test ones, stay ambiguous" {
+    const other_ts =
+        \\export function queryMemory(): string {
+        \\  return "other";
+        \\}
+        \\
+    ;
+    {
+        var ex = Explorer.init(testing.allocator, 16);
+        defer ex.deinit();
+        try ex.indexFile("src/capn.ts", capn_ts);
+        try ex.indexFile("src/other.ts", other_ts);
+        try ex.indexFile("test/capn.test.ts", capn_mock_ts);
+
+        const callers = try ex.callersOfWithStats("queryMemory", testing.allocator, 50);
+        defer freeSteps(callers.steps);
+        try testing.expect(!callers.resolved);
+        try testing.expectEqual(@as(usize, 0), callers.steps.len);
+
+        // The ambiguity response lists every definition, test ones included.
+        const both = try ex.bothNeighborsOf("queryMemory", testing.allocator, 50);
+        defer freeCandidates(both.candidates);
+        try testing.expect(both.ambiguous);
+        try testing.expectEqual(@as(usize, 0), both.callers.len + both.callees.len);
+        try testing.expectEqual(@as(usize, 4), both.candidates.len);
+    }
+    {
+        var ex = Explorer.init(testing.allocator, 16);
+        defer ex.deinit();
+        try ex.indexFile("test/capn.test.ts", capn_mock_ts);
+
+        const both = try ex.bothNeighborsOf("queryMemory", testing.allocator, 50);
+        defer freeCandidates(both.candidates);
+        try testing.expect(both.ambiguous);
+        try testing.expectEqual(@as(usize, 2), both.candidates.len);
+    }
+}
+
 test "ts outline: qualified names for class and object-literal members" {
     const src =
         \\export class Svc {

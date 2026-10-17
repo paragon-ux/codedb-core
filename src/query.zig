@@ -400,6 +400,9 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
     for (cands) |r| {
         if (r.symbol.kind == .function or r.symbol.kind == .method) callable_count += 1;
     }
+    // A name that resolved to one node is never ambiguous, even with no
+    // neighbors (other definitions may be test-file ones it was preferred over).
+    const ambiguous = !stats.resolved and callable_count > 1;
 
     if (json) {
         var buf: std.ArrayList(u8) = .empty;
@@ -410,7 +413,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
             buf.appendSlice(a, ",\"id\":") catch {};
             appendJsonStr(a, &buf, rid);
         }
-        if (callable_count > 1) {
+        if (ambiguous) {
             buf.appendSlice(a, ",\"ambiguous\":true,\"count\":") catch {};
             jsonInt(a, &buf, callable_count);
             buf.appendSlice(a, ",\"results\":[") catch {};
@@ -444,7 +447,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
         return 0;
     }
 
-    if (callable_count > 1) {
+    if (ambiguous) {
         out.p("{s}\xe2\x9c\x97{s} {s}{s}{s} is ambiguous ({s}{d}{s} definitions):\n", .{
             s.yellow, s.reset, s.bold, name, s.reset, s.bold, callable_count, s.reset,
         });
