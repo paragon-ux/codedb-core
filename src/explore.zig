@@ -53,6 +53,11 @@ pub const Symbol = struct {
     line_start: u32,
     line_end: u32,
     detail: ?[]const u8 = null,
+    /// Owner-qualified name of a TS/JS member: `Class.member`, or
+    /// `binding.member` for an object literal assigned to a const/let/var
+    /// (`default` for `export default {`), nested objects joined with dots.
+    /// Null when the symbol has no owner; `name` stays the bare name.
+    qualified: ?[]const u8 = null,
 };
 
 /// Query-independent path-prior flags shared by the rerankers — a pure
@@ -141,6 +146,7 @@ pub const FileOutline = struct {
             for (self.symbols.items) |sym| {
                 self.allocator.free(sym.name);
                 if (sym.detail) |d| self.allocator.free(d);
+                if (sym.qualified) |q| self.allocator.free(q);
             }
             for (self.imports.items) |imp| self.allocator.free(imp);
         }
@@ -694,14 +700,27 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
     return ti == path.len;
 }
 
+/// What a call-graph node stands for. A `module` node is one TS/JS file's
+/// top-level code (everything outside its function and method spans): it
+/// calls but is never called, so nothing resolves to it.
+pub const CallNodeKind = enum(u8) { function, method, module };
+
+/// Name, qualified name and line of every module node.
+pub const module_node_name = "<module>";
+
 /// Resolved call graph retained for path queries (#531). Node metadata slices
 /// borrow stable outline/symbol strings; edges and adjacency are owned.
+/// Module nodes come after every function/method node.
 pub const CallGraph = struct {
     edges: []codegraph.Edge,
     adj: []std.ArrayList(codegraph.NodeId),
     radj: []std.ArrayList(codegraph.NodeId),
     node_path: []const []const u8,
     node_name: []const []const u8,
+    /// `Class.member` / `binding.member` for qualified TS/JS members, else
+    /// the same as `node_name`.
+    node_qualified: []const []const u8,
+    node_kind: []const CallNodeKind,
     node_line: []const u32,
     node_dropped_ambiguous_callers: []const u32,
     node_dropped_ambiguous_callees: []const u32,
@@ -714,9 +733,19 @@ pub const CallGraph = struct {
         allocator.free(self.node_path);
         for (self.node_name) |n| allocator.free(n);
         allocator.free(self.node_name);
+        for (self.node_qualified) |q| allocator.free(q);
+        allocator.free(self.node_qualified);
+        allocator.free(self.node_kind);
         allocator.free(self.node_line);
         allocator.free(self.node_dropped_ambiguous_callers);
         allocator.free(self.node_dropped_ambiguous_callees);
+    }
+
+    /// Whether node `i` is the target `name`: a dotted name matches the
+    /// qualified name exactly, a bare name matches the bare name.
+    pub fn nodeMatches(self: *const CallGraph, i: usize, name: []const u8) bool {
+        const names = if (std.mem.indexOfScalar(u8, name, '.') != null) self.node_qualified else self.node_name;
+        return std.mem.eql(u8, names[i], name);
     }
 };
 
@@ -724,6 +753,10 @@ pub const CallPathStep = struct {
     path: []const u8,
     name: []const u8,
     line: u32,
+    kind: CallNodeKind = .function,
+    /// Owned like `path` and `name` where those are (callersOf, calleesOf,
+    /// bothNeighborsOf); borrowed from the graph in findCallPath.
+    qualified: []const u8 = "",
 };
 
 /// rVSM file-size prior (BugLocator — Zhou et al., ICSE 2012). IR-based fault
@@ -2777,6 +2810,10 @@ pub const Explorer = struct {
                 if (detail.len > std.math.maxInt(usize) - string_bytes) return error.OutOfMemory;
                 string_bytes += detail.len;
             }
+            if (sym.qualified) |q| {
+                if (q.len > std.math.maxInt(usize) - string_bytes) return error.OutOfMemory;
+                string_bytes += q.len;
+            }
         }
         for (src.imports.items) |imp| {
             if (imp.len > std.math.maxInt(usize) - string_bytes) return error.OutOfMemory;
@@ -2808,12 +2845,19 @@ pub const Explorer = struct {
                 cursor += detail.len;
                 break :blk copied;
             } else null;
+            const copied_qualified: ?[]const u8 = if (sym.qualified) |q| blk: {
+                const copied = storage[cursor .. cursor + q.len];
+                @memcpy(copied, q);
+                cursor += q.len;
+                break :blk copied;
+            } else null;
             dst.symbols.appendAssumeCapacity(.{
                 .name = copied_name,
                 .kind = sym.kind,
                 .line_start = sym.line_start,
                 .line_end = sym.line_end,
                 .detail = copied_detail,
+                .qualified = copied_qualified,
             });
         }
         for (src.imports.items) |imp| {
@@ -2850,6 +2894,8 @@ pub const Explorer = struct {
                 break :blk detail;
             } else null;
             errdefer if (copied_detail) |d| allocator.free(d);
+            const copied_qualified = if (sym.qualified) |q| try allocator.dupe(u8, q) else null;
+            errdefer if (copied_qualified) |q| allocator.free(q);
 
             dst.symbols.appendAssumeCapacity(.{
                 .name = copied_name,
@@ -2857,6 +2903,7 @@ pub const Explorer = struct {
                 .line_start = sym.line_start,
                 .line_end = sym.line_end,
                 .detail = copied_detail,
+                .qualified = copied_qualified,
             });
         }
         for (src.imports.items) |imp| {
@@ -4807,6 +4854,8 @@ pub const Explorer = struct {
             }
             for (cg.radj[nid].items) |nb| {
                 if (dist[nb] != unseen) continue;
+                // A module node would link every function its file calls.
+                if (cg.node_kind[nb] == .module) continue;
                 dist[nb] = d + 1;
                 queue.append(ta, nb) catch return null;
             }
@@ -4953,6 +5002,21 @@ pub const Explorer = struct {
         }
     };
 
+    fn dupeNodeMeta(self: *Explorer, qualified: []const []const u8, kind: []const CallNodeKind) !struct { qualified: []const []const u8, kind: []const CallNodeKind } {
+        const nq = try self.allocator.alloc([]const u8, qualified.len);
+        var filled: usize = 0;
+        errdefer {
+            for (nq[0..filled]) |s| self.allocator.free(s);
+            self.allocator.free(nq);
+        }
+        for (qualified, 0..) |q, i| {
+            nq[i] = try self.allocator.dupe(u8, q);
+            filled += 1;
+        }
+        const nk = try self.allocator.dupe(CallNodeKind, kind);
+        return .{ .qualified = nq, .kind = nk };
+    }
+
     /// Build the resolved call graph once (idempotent, mutex-guarded). Must be
     /// called while holding at least a shared lock on `mu`. Retains edges for
     /// codedb_callpath and computes per-file centrality (PageRank by default).
@@ -4975,8 +5039,13 @@ pub const Explorer = struct {
         var node_name: std.ArrayList([]const u8) = .empty;
         var node_line: std.ArrayList(u32) = .empty;
         var node_is_method: std.ArrayList(bool) = .empty;
+        var node_qualified: std.ArrayList([]const u8) = .empty;
+        var node_kind: std.ArrayList(CallNodeKind) = .empty;
         var funcs: std.ArrayList(codegraph.FuncInput) = .empty;
         var name_to_ids = std.StringHashMap(std.ArrayList(codegraph.NodeId)).init(a);
+        // TS/JS files' top-level code, turned into module nodes after the loop.
+        const ModuleBody = struct { path: []const u8, body: []const u8 };
+        var modules: std.ArrayList(ModuleBody) = .empty;
 
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
@@ -5002,11 +5071,43 @@ pub const Explorer = struct {
                 node_name.append(a, sym.name) catch return;
                 node_line.append(a, sym.line_start) catch return;
                 node_is_method.append(a, sym.kind == .method) catch return;
+                node_qualified.append(a, sym.qualified orelse sym.name) catch return;
+                node_kind.append(a, if (sym.kind == .method) .method else .function) catch return;
                 funcs.append(a, .{ .id = id, .body = skipOwnName(content[start..end], sym.name) }) catch return;
                 const gop = name_to_ids.getOrPut(sym.name) catch return;
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 gop.value_ptr.append(a, id) catch return;
             }
+            const lang = entry.value_ptr.language;
+            if (lang == .typescript or lang == .javascript) {
+                // The module body is the file with every function and method
+                // span blanked, so it owns only what no named node owns.
+                const body = a.dupe(u8, content) catch return;
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (sym.kind != .function and sym.kind != .method) continue;
+                    if (sym.line_start == 0 or sym.line_start > nlines) continue;
+                    const start = offs.items[sym.line_start - 1];
+                    const end_line = @min(sym.line_end, nlines);
+                    const end = if (end_line < nlines) offs.items[end_line] else content.len;
+                    if (end <= start) continue;
+                    for (body[start..end]) |*ch| {
+                        if (ch.* != '\n') ch.* = ' ';
+                    }
+                }
+                modules.append(a, .{ .path = path, .body = body }) catch return;
+            }
+        }
+        // Function and method nodes first: centrality covers only those.
+        const n_fn_nodes = node_path.items.len;
+        for (modules.items) |m| {
+            const id: codegraph.NodeId = @intCast(node_path.items.len);
+            node_path.append(a, m.path) catch return;
+            node_name.append(a, module_node_name) catch return;
+            node_line.append(a, 1) catch return;
+            node_is_method.append(a, false) catch return;
+            node_qualified.append(a, module_node_name) catch return;
+            node_kind.append(a, .module) catch return;
+            funcs.append(a, .{ .id = id, .body = m.body }) catch return;
         }
         const n_nodes = node_path.items.len;
         if (n_nodes == 0) return;
@@ -5080,6 +5181,9 @@ pub const Explorer = struct {
             }
         }
         defer edges_tmp.deinit(a);
+        // Module callers ran last, so their edges trail the function edges.
+        var n_fn_edges: usize = 0;
+        while (n_fn_edges < edges_tmp.items.len and edges_tmp.items[n_fn_edges].from < n_fn_nodes) n_fn_edges += 1;
 
         const edges_owned = self.allocator.alloc(codegraph.Edge, edges_tmp.items.len) catch return;
         @memcpy(edges_owned, edges_tmp.items);
@@ -5138,10 +5242,13 @@ pub const Explorer = struct {
         };
         @memcpy(nl, node_line.items);
 
+        // Centrality ranks search results by file; module nodes stay out of
+        // it so they don't shift scores.
+        const fn_edges = edges_owned[0..n_fn_edges];
         const node_scores = if (cio.posixGetenv("CODEDB_IN_DEGREE_CENTRALITY") != null)
-            codegraph.inDegreeCentrality(self.allocator, edges_owned, n_nodes) catch null
+            codegraph.inDegreeCentrality(self.allocator, fn_edges, n_fn_nodes) catch null
         else
-            codegraph.pageRank(self.allocator, edges_owned, n_nodes, 0.85, 20) catch null;
+            codegraph.pageRank(self.allocator, fn_edges, n_fn_nodes, 0.85, 20) catch null;
         if (node_scores == null) {
             self.allocator.free(edges_owned);
             codegraph.freeAdjacency(self.allocator, adj);
@@ -5183,7 +5290,7 @@ pub const Explorer = struct {
 
         if (self.call_centrality == null) {
             var cmap = std.StringHashMap(f32).init(self.allocator);
-            for (node_path.items, node_scores.?) |path, score| {
+            for (node_path.items[0..n_fn_nodes], node_scores.?) |path, score| {
                 if (score == 0) continue;
                 const gop = cmap.getOrPut(path) catch continue;
                 if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -5219,12 +5326,28 @@ pub const Explorer = struct {
         };
         @memcpy(d_callees, dropped_callees);
 
+        const owned_meta = self.dupeNodeMeta(node_qualified.items, node_kind.items) catch {
+            self.allocator.free(edges_owned);
+            codegraph.freeAdjacency(self.allocator, adj);
+            codegraph.freeAdjacency(self.allocator, radj);
+            for (np) |s| self.allocator.free(s);
+            self.allocator.free(np);
+            for (nn) |s| self.allocator.free(s);
+            self.allocator.free(nn);
+            self.allocator.free(nl);
+            self.allocator.free(d_callers);
+            self.allocator.free(d_callees);
+            return;
+        };
+
         self.call_graph = .{
             .edges = edges_owned,
             .adj = adj,
             .radj = radj,
             .node_path = np,
             .node_name = nn,
+            .node_qualified = owned_meta.qualified,
+            .node_kind = owned_meta.kind,
             .node_line = nl,
             .node_dropped_ambiguous_callers = d_callers,
             .node_dropped_ambiguous_callees = d_callees,
@@ -5287,6 +5410,8 @@ pub const Explorer = struct {
                 .path = cg.node_path[nid],
                 .name = cg.node_name[nid],
                 .line = cg.node_line[nid],
+                .kind = cg.node_kind[nid],
+                .qualified = cg.node_qualified[nid],
             });
         }
         return try steps.toOwnedSlice(allocator);
@@ -5341,8 +5466,8 @@ pub const Explorer = struct {
 
         var target: ?codegraph.NodeId = null;
         var matches: usize = 0;
-        for (cg.node_name, 0..) |n, i| {
-            if (std.mem.eql(u8, n, name)) {
+        for (0..cg.node_name.len) |i| {
+            if (cg.nodeMatches(i, name)) {
                 matches += 1;
                 if (matches > 1) return .{ .steps = &.{}, .dropped_callers = 0, .dropped_callees = 0 }; // ambiguous — fail closed
                 target = @intCast(i);
@@ -5355,16 +5480,27 @@ pub const Explorer = struct {
         errdefer steps.deinit(allocator);
         for (adj[id].items) |nid| {
             if (steps.items.len >= max) break;
-            try steps.append(allocator, .{
-                .path = try allocator.dupe(u8, cg.node_path[nid]),
-                .name = try allocator.dupe(u8, cg.node_name[nid]),
-                .line = cg.node_line[nid],
-            });
+            try steps.append(allocator, try ownedStep(allocator, &cg, nid));
         }
         return .{
             .steps = try steps.toOwnedSlice(allocator),
             .dropped_callers = cg.node_dropped_ambiguous_callers[id],
             .dropped_callees = cg.node_dropped_ambiguous_callees[id],
+        };
+    }
+
+    /// A step for node `nid` whose strings `allocator` owns.
+    fn ownedStep(allocator: std.mem.Allocator, cg: *const CallGraph, nid: codegraph.NodeId) !CallPathStep {
+        const path = try allocator.dupe(u8, cg.node_path[nid]);
+        errdefer allocator.free(path);
+        const name = try allocator.dupe(u8, cg.node_name[nid]);
+        errdefer allocator.free(name);
+        return .{
+            .path = path,
+            .name = name,
+            .line = cg.node_line[nid],
+            .kind = cg.node_kind[nid],
+            .qualified = try allocator.dupe(u8, cg.node_qualified[nid]),
         };
     }
 
@@ -5386,8 +5522,8 @@ pub const Explorer = struct {
         var target: ?codegraph.NodeId = null;
         var matches: usize = 0;
         if (cg) |graph| {
-            for (graph.node_name, 0..) |n, i| {
-                if (std.mem.eql(u8, n, name)) {
+            for (0..graph.node_name.len) |i| {
+                if (graph.nodeMatches(i, name)) {
                     matches += 1;
                     target = @intCast(i);
                 }
@@ -5401,22 +5537,14 @@ pub const Explorer = struct {
             errdefer callers_list.deinit(allocator);
             for (graph.radj[id].items) |nid| {
                 if (callers_list.items.len >= max) break;
-                try callers_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, graph.node_path[nid]),
-                    .name = try allocator.dupe(u8, graph.node_name[nid]),
-                    .line = graph.node_line[nid],
-                });
+                try callers_list.append(allocator, try ownedStep(allocator, &graph, nid));
             }
 
             var callees_list: std.ArrayList(CallPathStep) = .empty;
             errdefer callees_list.deinit(allocator);
             for (graph.adj[id].items) |nid| {
                 if (callees_list.items.len >= max) break;
-                try callees_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, graph.node_path[nid]),
-                    .name = try allocator.dupe(u8, graph.node_name[nid]),
-                    .line = graph.node_line[nid],
-                });
+                try callees_list.append(allocator, try ownedStep(allocator, &graph, nid));
             }
 
             const d_callers = graph.node_dropped_ambiguous_callers[id];
@@ -9013,6 +9141,9 @@ const TsScope = struct {
     kind: TsScopeKind,
     /// Paren depth when the brace opened; restored when it closes.
     paren_base: u32,
+    /// Qualifier for the members directly inside: the class name, or the
+    /// binding chain of an object literal (`tools`, `tools.nested`, `default`).
+    owner: ?[]const u8 = null,
 };
 
 const TsSigMode = enum(u8) {
@@ -9052,12 +9183,15 @@ const TsSig = struct {
     /// Owned copies for a member that is not inserted yet.
     name: ?[]u8 = null,
     detail: ?[]u8 = null,
+    qualified: ?[]u8 = null,
 
     fn freeOwned(self: *TsSig, a: std.mem.Allocator) void {
         if (self.name) |n| a.free(n);
         if (self.detail) |d| a.free(d);
+        if (self.qualified) |q| a.free(q);
         self.name = null;
         self.detail = null;
+        self.qualified = null;
     }
 };
 
@@ -9101,10 +9235,17 @@ const TsParseState = struct {
     /// Last two significant chars seen by the brace counter.
     prev_sig: u8 = 0,
     prev_sig2: u8 = 0,
-    /// A `class`/`interface`/`enum`/`type` head waiting for its brace.
+    /// A `class`/`interface`/`enum`/`type` head waiting for its brace, and
+    /// the class name its body qualifies members with.
     head: ?TsScopeKind = null,
+    head_name: ?[]const u8 = null,
     head_paren: u32 = 0,
     head_lines_left: u32 = 0,
+    /// This line's object-literal brace (index in the masked line) that
+    /// opens an owned object, and its owner.
+    next_owner: ?struct { brace: usize, owner: []const u8 } = null,
+    /// Owner strings, freed with the state.
+    owners: std.ArrayList([]u8) = .empty,
     sig: ?TsSig = null,
     exprs: std.ArrayList(TsExprEnd) = .empty,
     new_symbols: std.ArrayList(TsNewSymbol) = .empty,
@@ -9124,6 +9265,16 @@ const TsParseState = struct {
         self.fixed_ends.deinit(a);
         self.not_bodies.deinit(a);
         self.mask.deinit(a);
+        for (self.owners.items) |o| a.free(o);
+        self.owners.deinit(a);
+    }
+
+    /// `prefix.name` (or `name`), kept until deinit.
+    fn ownerString(self: *TsParseState, a: std.mem.Allocator, prefix: ?[]const u8, name: []const u8) ![]const u8 {
+        const s = if (prefix) |p| try std.fmt.allocPrint(a, "{s}.{s}", .{ p, name }) else try a.dupe(u8, name);
+        errdefer a.free(s);
+        try self.owners.append(a, s);
+        return s;
     }
 
     /// Process one trimmed line. `claimed` means this line's symbol was
@@ -9169,11 +9320,18 @@ const TsParseState = struct {
                 self.head = kind;
                 self.head_paren = line_paren;
                 self.head_lines_left = 8;
+                self.head_name = if (kind == .class_body) if (tsClassName(code)) |n| try self.ownerString(a, null, n) else null else null;
             }
             claimed = try self.detect(a, outline, line, code, line_num, top, line_paren);
+            if (!claimed and line_paren == (if (top) |t| t.paren_base else 0)) {
+                if (tsObjectOwner(code, top)) |o| {
+                    self.next_owner = .{ .brace = o.brace, .owner = try self.ownerString(a, o.prefix, code[o.name_start..o.name_end]) };
+                }
+            }
         }
 
         try self.countLine(a, code);
+        self.next_owner = null;
         return .{ .claimed = claimed, .code = code };
     }
 
@@ -9224,10 +9382,11 @@ const TsParseState = struct {
         } else {
             sig.index = outline.symbols.items.len;
             sig.kind = .method;
+            errdefer sig.freeOwned(a);
             sig.name = try a.dupe(u8, name);
-            sig.detail = a.dupe(u8, line) catch |err| {
-                sig.freeOwned(a);
-                return err;
+            sig.detail = try a.dupe(u8, line);
+            if (top) |t| if (t.owner) |o| {
+                sig.qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ o, name });
             };
         }
         if (outcome == .pending) {
@@ -9250,10 +9409,12 @@ const TsParseState = struct {
                 .line_start = sig.line_num,
                 .line_end = sig.line_num,
                 .detail = sig.detail,
+                .qualified = sig.qualified,
             });
             outline.name_len_mask |= FileOutline.nameLenBit(name.len);
             sig.name = null;
             sig.detail = null;
+            sig.qualified = null;
         }
         try self.new_symbols.append(a, .{ .index = sig.index, .fallback = sig.fallback });
         switch (outcome) {
@@ -9401,8 +9562,14 @@ const TsParseState = struct {
                 '(' => self.paren_depth += 1,
                 ')' => self.paren_depth -|= 1,
                 '{' => {
-                    const kind = self.braceKind(i + 1 == code.len);
-                    try self.scopes.append(a, .{ .kind = kind, .paren_base = self.paren_depth });
+                    var owner: ?[]const u8 = null;
+                    const kind = self.braceKind(i + 1 == code.len, &owner);
+                    if (kind == .other) {
+                        if (self.next_owner) |no| {
+                            if (no.brace == i) owner = no.owner;
+                        }
+                    }
+                    try self.scopes.append(a, .{ .kind = kind, .paren_base = self.paren_depth, .owner = owner });
                 },
                 '}' => if (self.scopes.pop()) |s| {
                     self.paren_depth = s.paren_base;
@@ -9422,13 +9589,16 @@ const TsParseState = struct {
         }
     }
 
-    fn braceKind(self: *TsParseState, last_on_line: bool) TsScopeKind {
+    fn braceKind(self: *TsParseState, last_on_line: bool, owner: *?[]const u8) TsScopeKind {
         if (self.head) |h| {
             if (self.paren_depth == self.head_paren) {
                 self.head = null;
                 // A class body brace ends its head line; an earlier brace is
                 // a one-line `class A {}` or a type argument.
-                return if (h == .type_body or last_on_line) h else .other;
+                if (h == .type_body) return h;
+                if (!last_on_line) return .other;
+                owner.* = self.head_name;
+                return h;
             }
         }
         const top: ?TsScope = if (self.scopes.items.len > 0) self.scopes.items[self.scopes.items.len - 1] else null;
@@ -9494,6 +9664,7 @@ const TsParseState = struct {
             if (sym.line_start == 0) {
                 a.free(sym.name);
                 if (sym.detail) |d| a.free(d);
+                if (sym.qualified) |q| a.free(q);
                 continue;
             }
             outline.symbols.items[w] = sym;
@@ -9788,6 +9959,94 @@ fn tsConstDecl(code: []const u8) ?TsCandidate {
     if (eq + 1 < code.len and (code[eq + 1] == '>' or code[eq + 1] == '=')) return null;
     if (!tsFunctionValue(code, eq + 1, &c) or c.mode != .arrow) return null;
     return c;
+}
+
+/// The name a class head gives its members: `class Name`, else the binding
+/// of `const Name = class {`.
+fn tsClassName(code: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, code, from, "class")) |p| : (from = p + 5) {
+        if (p > 0 and tsIsIdentChar(code[p - 1])) continue;
+        const e = tsWordAt(code, p, "class") orelse continue;
+        const i = tsSkipWs(code, e);
+        const n = tsIdentEnd(code, i);
+        if (n > i and tsWordAt(code, i, "extends") == null and tsWordAt(code, i, "implements") == null) return code[i..n];
+        break;
+    }
+    const decl = tsConstDecl(code) orelse blk: {
+        // `const Name = class {` is not an arrow, so tsConstDecl skips it.
+        var i: usize = 0;
+        if (tsWordAt(code, i, "export")) |e| i = tsSkipWs(code, e);
+        const kw = tsWordAt(code, i, "const") orelse tsWordAt(code, i, "let") orelse tsWordAt(code, i, "var") orelse return null;
+        i = tsSkipWs(code, kw);
+        const n = tsIdentEnd(code, i);
+        if (n == i) return null;
+        break :blk TsCandidate{ .name_start = i, .name_end = n, .decl = true };
+    };
+    return code[decl.name_start..decl.name_end];
+}
+
+/// An object literal that opens on this line with an owner: `const name = {`
+/// (`default` for `export default {`), or as `name: {` / a class field
+/// `name = {` inside an owned scope. Unowned objects (call arguments,
+/// properties of unowned objects) keep their members' bare names.
+fn tsObjectOwner(code: []const u8, top: ?TsScope) ?struct { name_start: usize, name_end: usize, brace: usize, prefix: ?[]const u8 } {
+    var i: usize = 0;
+    if (tsWordAt(code, i, "export")) |e| {
+        i = tsSkipWs(code, e);
+        if (tsWordAt(code, i, "default")) |d| {
+            const b = tsSkipWs(code, d);
+            if (b < code.len and code[b] == '{') return .{ .name_start = i, .name_end = d, .brace = b, .prefix = null };
+            return null;
+        }
+    }
+    if (tsWordAt(code, i, "const") orelse tsWordAt(code, i, "let") orelse tsWordAt(code, i, "var")) |kw| {
+        const n0 = tsSkipWs(code, kw);
+        const n1 = tsIdentEnd(code, n0);
+        if (n1 == n0) return null;
+        var j = tsSkipWs(code, n1);
+        if (j < code.len and code[j] == '!') j = tsSkipWs(code, j + 1);
+        if (j >= code.len) return null;
+        const eq = switch (code[j]) {
+            ':' => tsAssignIndex(code, j + 1) orelse return null,
+            '=' => j,
+            else => return null,
+        };
+        const b = tsSkipWs(code, eq + 1);
+        if (b < code.len and code[b] == '{') return .{ .name_start = n0, .name_end = n1, .brace = b, .prefix = null };
+        return null;
+    }
+    const t = top orelse return null;
+    const prefix = t.owner orelse return null;
+    switch (t.kind) {
+        .type_body => return null,
+        .other => {
+            const n1 = tsIdentEnd(code, 0);
+            if (n1 == 0) return null;
+            const j = tsSkipWs(code, n1);
+            if (j >= code.len or code[j] != ':') return null;
+            const b = tsSkipWs(code, j + 1);
+            if (b < code.len and code[b] == '{') return .{ .name_start = 0, .name_end = n1, .brace = b, .prefix = prefix };
+            return null;
+        },
+        .class_body => {
+            var n0 = tsSkipModifiers(code, 0, &ts_class_modifiers);
+            if (n0 < code.len and code[n0] == '#') n0 += 1;
+            const n1 = tsIdentEnd(code, n0);
+            if (n1 == n0) return null;
+            var j = tsSkipWs(code, n1);
+            if (j < code.len and (code[j] == '?' or code[j] == '!')) j = tsSkipWs(code, j + 1);
+            if (j >= code.len) return null;
+            const eq = switch (code[j]) {
+                ':' => tsAssignIndex(code, j + 1) orelse return null,
+                '=' => j,
+                else => return null,
+            };
+            const b = tsSkipWs(code, eq + 1);
+            if (b < code.len and code[b] == '{') return .{ .name_start = n0, .name_end = n1, .brace = b, .prefix = prefix };
+            return null;
+        },
+    }
 }
 
 /// The scope a `class`/`interface`/`enum`/`type`/`declare module` head opens.

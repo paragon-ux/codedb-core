@@ -93,19 +93,13 @@ test "ts call graph: callers in arrow consts, object handlers and class methods 
     try ex.indexFile("src/use.ts", use_ts);
 
     const steps = try ex.callersOf("target", testing.allocator, 50);
-    defer {
-        for (steps) |s| {
-            testing.allocator.free(s.path);
-            testing.allocator.free(s.name);
-        }
-        testing.allocator.free(steps);
-    }
-    const Step = struct { name: []const u8, line: u32 };
+    defer freeSteps(steps);
+    const Step = struct { name: []const u8, qualified: []const u8, kind: explore.CallNodeKind, line: u32 };
     var got: std.ArrayList(Step) = .empty;
     defer got.deinit(testing.allocator);
     for (steps) |s| {
         try testing.expectEqualStrings("src/use.ts", s.path);
-        try got.append(testing.allocator, .{ .name = s.name, .line = s.line });
+        try got.append(testing.allocator, .{ .name = s.name, .qualified = s.qualified, .kind = s.kind, .line = s.line });
     }
     std.mem.sort(Step, got.items, {}, struct {
         fn lt(_: void, x: Step, y: Step) bool {
@@ -113,18 +107,210 @@ test "ts call graph: callers in arrow consts, object handlers and class methods 
         }
     }.lt);
     const want = [_]Step{
-        .{ .name = "viaFunction", .line = 3 },
-        .{ .name = "viaArrow", .line = 7 },
-        .{ .name = "handler", .line = 13 },
-        .{ .name = "run", .line = 19 },
-        .{ .name = "start", .line = 23 },
+        .{ .name = "viaFunction", .qualified = "viaFunction", .kind = .function, .line = 3 },
+        .{ .name = "viaArrow", .qualified = "viaArrow", .kind = .function, .line = 7 },
+        .{ .name = "handler", .qualified = "tool.handler", .kind = .method, .line = 13 },
+        .{ .name = "run", .qualified = "Svc.run", .kind = .method, .line = 19 },
+        .{ .name = "start", .qualified = "Svc.start", .kind = .method, .line = 23 },
     };
-    errdefer for (got.items) |g| std.debug.print("  caller {s}:{d}\n", .{ g.name, g.line });
+    errdefer for (got.items) |g| std.debug.print("  caller {s} {s} {t}:{d}\n", .{ g.name, g.qualified, g.kind, g.line });
     try testing.expectEqual(want.len, got.items.len);
     for (want, got.items) |w, g| {
         try testing.expectEqualStrings(w.name, g.name);
+        try testing.expectEqualStrings(w.qualified, g.qualified);
+        try testing.expectEqual(w.kind, g.kind);
         try testing.expectEqual(w.line, g.line);
     }
+}
+
+fn freeSteps(steps: []const explore.CallPathStep) void {
+    for (steps) |s| {
+        testing.allocator.free(s.path);
+        testing.allocator.free(s.name);
+        testing.allocator.free(s.qualified);
+    }
+    testing.allocator.free(steps);
+}
+
+test "ts call graph: a qualified name resolves where the bare name is ambiguous" {
+    const src =
+        \\export class A {
+        \\  start(): number {
+        \\    return helper();
+        \\  }
+        \\}
+        \\export class B {
+        \\  start(): number {
+        \\    return 2;
+        \\  }
+        \\}
+        \\export function helper(): number {
+        \\  return 1;
+        \\}
+        \\export function boot(a: A): number {
+        \\  return a.start();
+        \\}
+        \\
+    ;
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    try ex.indexFile("src/ab.ts", src);
+
+    // Bare `start` names two nodes: fail closed, as before.
+    const bare = try ex.calleesOf("start", testing.allocator, 50);
+    defer freeSteps(bare);
+    try testing.expectEqual(@as(usize, 0), bare.len);
+
+    const callees = try ex.calleesOf("A.start", testing.allocator, 50);
+    defer freeSteps(callees);
+    try testing.expectEqual(@as(usize, 1), callees.len);
+    try testing.expectEqualStrings("helper", callees[0].name);
+    try testing.expectEqual(explore.CallNodeKind.function, callees[0].kind);
+
+    // `a.start()` keeps both methods as candidates, so it stays ambiguous.
+    const callers = try ex.callersOf("A.start", testing.allocator, 50);
+    defer freeSteps(callers);
+    try testing.expectEqual(@as(usize, 0), callers.len);
+
+    const missing = try ex.callersOf("C.start", testing.allocator, 50);
+    defer freeSteps(missing);
+    try testing.expectEqual(@as(usize, 0), missing.len);
+
+    var both = try ex.bothNeighborsOf("B.start", testing.allocator, 50);
+    defer {
+        freeSteps(both.callers);
+        freeSteps(both.callees);
+    }
+    try testing.expect(both.symbol_exists and !both.ambiguous);
+    _ = &both;
+}
+
+test "ts outline: qualified names for class and object-literal members" {
+    const src =
+        \\export class Svc {
+        \\  handlers = {
+        \\    onData: (d: string) => {
+        \\      work(d);
+        \\    },
+        \\  };
+        \\  start() {
+        \\    work(1);
+        \\  }
+        \\}
+        \\export const tools = {
+        \\  handler: async () => {
+        \\    work(2);
+        \\  },
+        \\  nested: {
+        \\    inner() {
+        \\      work(3);
+        \\    },
+        \\  },
+        \\};
+        \\export default {
+        \\  setup() {
+        \\    work(4);
+        \\  },
+        \\};
+        \\register({
+        \\  loose() {
+        \\    work(5);
+        \\  },
+        \\});
+        \\const Named = class {
+        \\  run() {
+        \\    work(6);
+        \\  }
+        \\};
+        \\
+    ;
+    var parsed = try Explorer.parseContentForIndexing(testing.allocator, "src/q.ts", src);
+    defer parsed.deinit();
+    const Want = struct { name: []const u8, line: u32, qualified: ?[]const u8 };
+    const want = [_]Want{
+        .{ .name = "onData", .line = 3, .qualified = "Svc.handlers.onData" },
+        .{ .name = "start", .line = 7, .qualified = "Svc.start" },
+        .{ .name = "handler", .line = 12, .qualified = "tools.handler" },
+        .{ .name = "inner", .line = 16, .qualified = "tools.nested.inner" },
+        .{ .name = "setup", .line = 22, .qualified = "default.setup" },
+        .{ .name = "loose", .line = 27, .qualified = null },
+        .{ .name = "run", .line = 32, .qualified = "Named.run" },
+    };
+    for (want) |w| {
+        const sym = for (parsed.outline.symbols.items) |s| {
+            if (s.line_start == w.line and std.mem.eql(u8, s.name, w.name)) break s;
+        } else {
+            std.debug.print("no symbol {s} on line {d}\n", .{ w.name, w.line });
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(SymbolKind.method, sym.kind);
+        if (w.qualified) |q| {
+            try testing.expectEqualStrings(q, sym.qualified orelse "");
+        } else try testing.expect(sym.qualified == null);
+    }
+}
+
+test "ts call graph: a module node owns top-level calls and anonymous callbacks" {
+    const lib =
+        \\export function target(): number {
+        \\  return 1;
+        \\}
+        \\export function other(): number {
+        \\  return 2;
+        \\}
+        \\export class Daemon {
+        \\  start(): void {}
+        \\}
+        \\
+    ;
+    const app =
+        \\import { target, other, Daemon } from "./lib";
+        \\
+        \\target();
+        \\test("runs", async () => {
+        \\  await target();
+        \\});
+        \\process.once("exit", () => target());
+        \\
+        \\export function named(): number {
+        \\  return other();
+        \\}
+        \\start();
+        \\new Daemon().start();
+        \\
+    ;
+    var ex = Explorer.init(testing.allocator, 16);
+    defer ex.deinit();
+    try ex.indexFile("src/lib.ts", lib);
+    try ex.indexFile("src/app.ts", app);
+
+    const callers = try ex.callersOf("target", testing.allocator, 50);
+    defer freeSteps(callers);
+    try testing.expectEqual(@as(usize, 1), callers.len);
+    try testing.expectEqualStrings("src/app.ts", callers[0].path);
+    try testing.expectEqualStrings("<module>", callers[0].name);
+    try testing.expectEqualStrings("<module>", callers[0].qualified);
+    try testing.expectEqual(explore.CallNodeKind.module, callers[0].kind);
+    try testing.expectEqual(@as(u32, 1), callers[0].line);
+
+    // `other()` belongs to `named`, not to the module as well.
+    const other_callers = try ex.callersOf("other", testing.allocator, 50);
+    defer freeSteps(other_callers);
+    try testing.expectEqual(@as(usize, 1), other_callers.len);
+    try testing.expectEqualStrings("named", other_callers[0].name);
+
+    // The bare-call rule holds for module code: only `new Daemon().start()`.
+    const start_callers = try ex.callersOf("Daemon.start", testing.allocator, 50);
+    defer freeSteps(start_callers);
+    try testing.expectEqual(@as(usize, 1), start_callers.len);
+    try testing.expectEqual(explore.CallNodeKind.module, start_callers[0].kind);
+
+    // Nothing resolves to a module node.
+    const cg = ex.call_graph.?;
+    var modules: usize = 0;
+    for (cg.node_kind) |k| modules += @intFromBool(k == .module);
+    try testing.expectEqual(@as(usize, 2), modules);
+    for (cg.edges) |e| try testing.expect(cg.node_kind[e.to] != .module);
 }
 
 test "ts call graph: a method's own signature is not a call to its namesake" {
@@ -149,7 +335,8 @@ test "ts call graph: a method's own signature is not a call to its namesake" {
     try ex.indexFile("src/ab.ts", src);
     const steps = try ex.callersOf("start", testing.allocator, 50); // builds the graph
     defer testing.allocator.free(steps);
-    try testing.expectEqual(@as(usize, 2), ex.call_graph.?.node_name.len);
+    // Two methods and the file's module node.
+    try testing.expectEqual(@as(usize, 3), ex.call_graph.?.node_name.len);
     try testing.expectEqual(@as(usize, 0), ex.call_graph.?.edges.len);
 }
 

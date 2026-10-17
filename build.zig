@@ -112,6 +112,20 @@ pub fn build(b: *std.Build) void {
     });
     version_tests.root_module.addOptions("build_options", version_opts);
     test_step.dependOn(&b.addRunArtifact(version_tests).step);
+
+    // ── End-to-end: call-graph JSON carries kind/qualified ──
+    const json_opts = b.addOptions();
+    json_opts.addOptionPath("codedb_exe", exe.getEmittedBin());
+    const json_tests = b.addTest(.{
+        .name = "neighbors-json",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/neighbors_json_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    json_tests.root_module.addOptions("build_options", json_opts);
+    test_step.dependOn(&b.addRunArtifact(json_tests).step);
 }
 
 /// package.json's "version". Embedded, so editing package.json reconfigures

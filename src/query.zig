@@ -313,6 +313,27 @@ fn runSymbol(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Style,
 
 // ── callers / callees ─────────────────────────────────────────────────────
 
+/// One call-graph node: `{"path","name","line","kind","qualified"}`. `kind`
+/// is function, method or module; `qualified` is `Class.member` /
+/// `binding.member` for qualified TS/JS members and equals `name` otherwise.
+fn appendStepJson(a: std.mem.Allocator, buf: *std.ArrayList(u8), st: explore_mod.CallPathStep) void {
+    buf.appendSlice(a, "{\"path\":") catch {};
+    appendJsonStr(a, buf, st.path);
+    buf.appendSlice(a, ",\"name\":") catch {};
+    appendJsonStr(a, buf, st.name);
+    buf.appendSlice(a, ",\"line\":") catch {};
+    jsonInt(a, buf, st.line);
+    buf.appendSlice(a, ",\"kind\":") catch {};
+    appendJsonStr(a, buf, @tagName(st.kind));
+    buf.appendSlice(a, ",\"qualified\":") catch {};
+    appendJsonStr(a, buf, stepLabel(st));
+    buf.append(a, '}') catch {};
+}
+
+fn stepLabel(st: explore_mod.CallPathStep) []const u8 {
+    return if (st.qualified.len > 0) st.qualified else st.name;
+}
+
 fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Style, json: bool, reverse: bool, args: []const []const u8, start: usize, req_id: ?[]const u8) u8 {
     var pos: std.ArrayList([]const u8) = .empty;
     defer pos.deinit(a);
@@ -348,14 +369,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
             buf.appendSlice(a, ",\"results\":[") catch {};
             for (steps, 0..) |st, idx| {
                 if (idx > 0) buf.append(a, ',') catch {};
-                buf.append(a, '{') catch {};
-                buf.appendSlice(a, "\"path\":") catch {};
-                appendJsonStr(a, &buf, st.path);
-                buf.appendSlice(a, ",\"name\":") catch {};
-                appendJsonStr(a, &buf, st.name);
-                buf.appendSlice(a, ",\"line\":") catch {};
-                jsonInt(a, &buf, st.line);
-                buf.append(a, '}') catch {};
+                appendStepJson(a, &buf, st);
             }
             buf.appendSlice(a, "]}\n") catch {};
             out.p("{s}", .{buf.items});
@@ -366,7 +380,7 @@ fn runNeighbors(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Sty
         });
         for (steps) |st| {
             out.p("  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
-                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, st.name, s.reset,
+                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, stepLabel(st), s.reset,
             });
         }
         return 0;
@@ -533,14 +547,7 @@ fn runCombinedNeighbors(
         buf.appendSlice(a, ",\"results\":[") catch {};
         for (res.callers, 0..) |st, idx| {
             if (idx > 0) buf.append(a, ',') catch {};
-            buf.append(a, '{') catch {};
-            buf.appendSlice(a, "\"path\":") catch {};
-            appendJsonStr(a, &buf, st.path);
-            buf.appendSlice(a, ",\"name\":") catch {};
-            appendJsonStr(a, &buf, st.name);
-            buf.appendSlice(a, ",\"line\":") catch {};
-            jsonInt(a, &buf, st.line);
-            buf.append(a, '}') catch {};
+            appendStepJson(a, &buf, st);
         }
         buf.appendSlice(a, "]}") catch {};
 
@@ -550,14 +557,7 @@ fn runCombinedNeighbors(
         buf.appendSlice(a, ",\"results\":[") catch {};
         for (res.callees, 0..) |st, idx| {
             if (idx > 0) buf.append(a, ',') catch {};
-            buf.append(a, '{') catch {};
-            buf.appendSlice(a, "\"path\":") catch {};
-            appendJsonStr(a, &buf, st.path);
-            buf.appendSlice(a, ",\"name\":") catch {};
-            appendJsonStr(a, &buf, st.name);
-            buf.appendSlice(a, ",\"line\":") catch {};
-            jsonInt(a, &buf, st.line);
-            buf.append(a, '}') catch {};
+            appendStepJson(a, &buf, st);
         }
         buf.appendSlice(a, "]}}\n") catch {};
         out.p("{s}", .{buf.items});
@@ -587,7 +587,7 @@ fn runCombinedNeighbors(
         out.p("  callers ({d}):\n", .{res.callers.len});
         for (res.callers) |st| {
             out.p("    {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
-                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, st.name, s.reset,
+                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, stepLabel(st), s.reset,
             });
         }
     } else if (res.dropped_callers > 0) {
@@ -600,7 +600,7 @@ fn runCombinedNeighbors(
         out.p("  callees ({d}):\n", .{res.callees.len});
         for (res.callees) |st| {
             out.p("    {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
-                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, st.name, s.reset,
+                s.cyan, st.path, s.reset, s.dim, st.line, s.reset, s.bold, stepLabel(st), s.reset,
             });
         }
     } else if (res.dropped_callees > 0) {
@@ -658,7 +658,7 @@ fn runCallpath(explorer: *Explorer, a: std.mem.Allocator, out: *Out, s: sty.Styl
 
     for (steps, 0..) |st, idx| {
         out.p("  {d}. {s}{s}{s}  {s}{s}{s}:{s}{d}{s}\n", .{
-            idx + 1, s.bold, st.name, s.reset, s.cyan, st.path, s.reset, s.dim, st.line, s.reset,
+            idx + 1, s.bold, stepLabel(st), s.reset, s.cyan, st.path, s.reset, s.dim, st.line, s.reset,
         });
     }
     return 0;

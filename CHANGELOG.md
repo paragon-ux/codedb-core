@@ -9,11 +9,24 @@
   - Callables nested inside another function's body aren't added, because their calls already belong to that function.
   - An expression-bodied arrow ends where its expression ends instead of taking the next brace block in the file.
 - **TS/JS calls without a receiver never resolve to a method.** A method is reachable only through `obj.name(`, `this.name(`, or `super.name(`. A bare `start()` now resolves among free functions and arrow consts only, so a parameter named `start` no longer gets an edge to `WaymarkDaemon.start`. Also, a bare `stop()` beside a same-named method now reaches the free function instead of being ambiguous. Calls with a receiver keep every candidate, ambiguous names still emit no edge, and other languages resolve as before. `extractCalleeRefs` reports each callee's bare and receiver calls; `extractCallees` is unchanged.
+- **Every call-graph node in `--json` output has `kind` and `qualified`.** `callers`, `callees`, and `neighbors` results now look like `{"path","name","line","kind","qualified"}`:
+  - `kind` is `"function"`, `"method"`, or `"module"`.
+  - `qualified` is the owner-qualified name of a TS/JS member, and equals `name` otherwise. A class member is `Class.member`. An object-literal member is `binding.member`, where the binding is the `const`/`let`/`var` the object is assigned to, or `default` for `export default {`. Nested objects and class-field objects join with dots (`tools.nested.inner`, `Svc.handlers.onData`).
+  - An object without a binding, such as one passed as an argument, keeps bare names.
+  - `name` is unchanged and stays the bare name. In the library, `Symbol.qualified` holds the qualified name, and `CallPathStep` gains `kind` plus `qualified`, which callers of `callersOf`/`calleesOf`/`bothNeighborsOf` free along with `path` and `name`.
+- **`callers`, `callees`, and `neighbors` accept a qualified name.** A dotted name such as `WaymarkDaemon.start` matches a node's qualified name exactly. A bare name resolves as before, including the ambiguity response, so `start` is still ambiguous when two classes define it. Edge resolution is unchanged: calls are matched by their bare callee name.
+- **TS/JS module nodes for top-level code.** Each TS/JS file gets a node named `<module>` (kind `module`, line 1). Its body is the file with every function and method span blanked, so it owns calls in top-level statements and in anonymous top-level callbacks (`test("…", async () => {…})`, `process.once("exit", () => …)`) without duplicating calls that a named node owns.
+  - Module nodes only call: nothing resolves to them.
+  - They use the same resolution tiers as other nodes, including the bare-call rule.
+  - They're left out of the call-graph centrality and graph-distance boosts, so search ranking doesn't change.
 - **A declaration's own name no longer counts as a call** (all languages). Call-graph bodies start at the declaration line, so the `foo` in `fn foo(`, `def foo(`, or `async foo(` counted as a call to `foo`. When exactly one other definition of that name existed, this made a false edge, such as two unrelated `canonicalRoot` functions each calling the other. Nested `function helper(` and `fn lt(` declarations no longer count as calls either.
 - **TS/JS spans past multi-line template literals.** Skipping a template literal didn't count its newlines, so a function containing one ended early and lost the calls after it.
 - **Destructured parameters in typed TS arrows.** In `handler: ({ a }) => {` and `cb: T = ({ a }) => {`, the parameter's brace was taken as the body.
 - Lines like `parse(type: string) {` are no longer recorded as a `type_alias` named after the method.
-- **Tests**: `zig build test` now also runs `src/ts_callgraph_test.zig` (each shape above, the call graph across two files, bare and receiver calls, and negative cases) and the `codegraph.zig` unit tests, which were never part of the test build before.
+- **Tests**: `zig build test` now also runs:
+  - `src/ts_callgraph_test.zig`: each shape above, the call graph across two files, bare and receiver calls, qualified names and lookup, module nodes, and negative cases.
+  - `src/neighbors_json_test.zig`: runs the built CLI and checks the `kind`/`qualified` JSON and qualified queries.
+  - The `codegraph.zig` unit tests, which were never part of the test build before.
 
 ## 2.0.2
 
